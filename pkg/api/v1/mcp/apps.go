@@ -50,7 +50,28 @@ func (g *Group) getApp(ctx context.Context, a *auth.AuthInfo, args toolArgs) (an
 	}
 	out := g.deploymentView(d)
 	out["config"] = appConfigView(d.Stub.Type, cfg)
+	platformEnv, err := g.backendRepo.ListDeploymentEnv(ctx, a.Workspace.Id, d.Name)
+	if err != nil {
+		return nil, err
+	}
+	out["platform_env"] = platformEnvView(platformEnv)
 	return out, nil
+}
+
+// platformEnvView lists the variables set with set_env or connect_services,
+// which every deploy of the app keeps; the rest of config.env and
+// config.secrets comes from code. A secret binding names the secret, never its
+// value.
+func platformEnvView(env []types.DeploymentEnv) []map[string]string {
+	view := make([]map[string]string, 0, len(env))
+	for _, entry := range env {
+		if entry.SecretName != "" {
+			view = append(view, map[string]string{"key": entry.Key, "secret": entry.SecretName})
+		} else {
+			view = append(view, map[string]string{"key": entry.Key, "value": entry.Value})
+		}
+	}
+	return view
 }
 
 func appConfigView(stubType types.StubType, cfg *types.StubConfigV1) map[string]any {

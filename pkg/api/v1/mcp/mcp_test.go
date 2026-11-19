@@ -224,3 +224,16 @@ func TestMCPApiInProcess(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out.(map[string]any)["routes"])
 }
+
+func TestPlatformEnvViewNamesSecretsWithoutValues(t *testing.T) {
+	view := platformEnvView([]types.DeploymentEnv{
+		{Key: "DB_PASSWORD", SecretName: "db-pass", Value: "never-shown"},
+		{Key: "FOO", Value: "bar"},
+	})
+
+	require.Equal(t, []map[string]string{
+		{"key": "DB_PASSWORD", "secret": "db-pass"},
+		{"key": "FOO", "value": "bar"},
+	}, view)
+	require.Equal(t, []map[string]string{}, platformEnvView(nil))
+}

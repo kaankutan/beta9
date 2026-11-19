@@ -2413,6 +2413,46 @@ func (r *PostgresBackendRepository) DeleteSecret(ctx context.Context, workspace 
 	return nil
 }
 
+func (r *PostgresBackendRepository) ListDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string) ([]types.DeploymentEnv, error) {
+	query := `SELECT workspace_id, deployment_name, key, value, secret_name, created_at, updated_at
+FROM deployment_env WHERE workspace_id = $1 AND deployment_name = $2 ORDER BY key;`
+	env := []types.DeploymentEnv{}
+	if err := r.client.SelectContext(ctx, &env, query, workspaceId, deploymentName); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func (r *PostgresBackendRepository) UpdateDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string, set []types.DeploymentEnv, unset []string) error {
+	tx, err := r.client.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if len(unset) > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM deployment_env WHERE workspace_id = $1 AND deployment_name = $2 AND key = ANY($3);`,
+			workspaceId, deploymentName, pq.Array(unset)); err != nil {
+			return err
+		}
+	}
+	for _, entry := range set {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO deployment_env (workspace_id, deployment_name, key, value, secret_name)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (workspace_id, deployment_name, key)
+DO UPDATE SET value = EXCLUDED.value, secret_name = EXCLUDED.secret_name, updated_at = NOW();`,
+			workspaceId, deploymentName, entry.Key, entry.Value, entry.SecretName); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *PostgresBackendRepository) DeleteDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string) error {
+	_, err := r.client.ExecContext(ctx, `DELETE FROM deployment_env WHERE workspace_id = $1 AND deployment_name = $2;`, workspaceId, deploymentName)
+	return err
+}
+
 func (r *PostgresBackendRepository) UpdateSecret(ctx context.Context, workspace *types.Workspace, tokenId uint, secretName string, value string, hosts []string) (*types.Secret, error) {
 	validateHosts := hosts
 	if hosts == nil {

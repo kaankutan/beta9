@@ -1023,6 +1023,9 @@ func (gws *GatewayService) handleCheckpointEnabled(ctx context.Context, authInfo
 	return "", nil
 }
 
+// DeployStub deploys a stub as a new version of the deployment in.Name, with
+// the deployment's platform env (set_env, connect_services) applied on top of
+// the stub's own env.
 func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequest) (*pb.DeployStubResponse, error) {
 	authInfo, _ := auth.AuthInfoFromContext(ctx)
 
@@ -1075,6 +1078,17 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 		}
 	}
 
+	// Platform env is worked out and checked here, but a stub that carries it
+	// is stored only once the rollout plan has passed.
+	platformEnv, err := gws.applyPlatformEnv(ctx, authInfo, stub, &config, in.Name)
+	if err != nil {
+		return &pb.DeployStubResponse{
+			Ok:     false,
+			ErrMsg: err.Error(),
+		}, nil
+	}
+	config = platformEnv.config
+
 	rolloutPlan, err := gws.planDeploymentRollout(deploymentRolloutInput{
 		workspace: authInfo.Workspace,
 		stub:      stub,
@@ -1087,6 +1101,17 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 			Ok:     false,
 			ErrMsg: err.Error(),
 		}, nil
+	}
+	// Before anything is stopped, so a failure here leaves the running
+	// version untouched.
+	if platformEnv.changed {
+		stub, err = gws.createPlatformEnvStub(ctx, authInfo, stub, config)
+		if err != nil {
+			return &pb.DeployStubResponse{
+				Ok:     false,
+				ErrMsg: err.Error(),
+			}, nil
+		}
 	}
 	if rolloutPlan.stopLatest {
 		deploymentsToStop := activeDeployments
@@ -1134,7 +1159,7 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 		DeploymentId:  deployment.ExternalId,
 		Version:       uint32(deployment.Version),
 		InvokeUrl:     invokeUrl,
-		WarnMsg:       rolloutPlan.warning,
+		WarnMsg:       appendWarning(rolloutPlan.warning, platformEnv.warning()),
 		RolloutAction: rolloutPlan.action,
 	}, nil
 }

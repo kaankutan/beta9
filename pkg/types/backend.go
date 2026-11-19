@@ -1201,6 +1201,22 @@ func (s Secret) EnvVarName() string {
 	return s.Name
 }
 
+// DeploymentEnv is a variable set on a deployment through the platform
+// (set_env, connect_services) rather than in its code. It is kept apart from
+// the stub, so it applies to every version deployed under the name, code
+// pushes included, until it is removed. A non-empty SecretName binds that
+// workspace secret as Key; otherwise Key is set to Value. References were
+// resolved when it was set, so Value holds no `${{...}}`.
+type DeploymentEnv struct {
+	WorkspaceId    uint      `db:"workspace_id" json:"-"`
+	DeploymentName string    `db:"deployment_name" json:"-"`
+	Key            string    `db:"key" json:"key"`
+	Value          string    `db:"value" json:"value,omitempty"`
+	SecretName     string    `db:"secret_name" json:"secret_name,omitempty"`
+	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
+}
+
 const StackSpecMaxBytes = 256 << 10
 
 var ErrStackSpecTooLarge = fmt.Errorf("stack spec exceeds 256 KiB")

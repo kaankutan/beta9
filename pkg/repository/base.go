@@ -291,6 +291,11 @@ type BackendRepository interface {
 	ListSecrets(ctx context.Context, workspace *types.Workspace) ([]types.Secret, error)
 	UpdateSecret(ctx context.Context, workspace *types.Workspace, tokenId uint, secretName string, value string, hosts []string) (*types.Secret, error)
 	DeleteSecret(ctx context.Context, workspace *types.Workspace, secretName string) error
+	// Platform env of a deployment name, by key.
+	ListDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string) ([]types.DeploymentEnv, error)
+	// UpdateDeploymentEnv removes the unset keys and upserts set, in one transaction.
+	UpdateDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string, set []types.DeploymentEnv, unset []string) error
+	DeleteDeploymentEnv(ctx context.Context, workspaceId uint, deploymentName string) error
 	ListStacks(ctx context.Context, workspaceId uint) ([]types.Stack, error)
 	CreateStack(ctx context.Context, workspaceId uint, name string, spec json.RawMessage) (*types.Stack, error)
 	UpdateStack(ctx context.Context, workspaceId uint, externalId, name string, spec json.RawMessage) (*types.Stack, error)

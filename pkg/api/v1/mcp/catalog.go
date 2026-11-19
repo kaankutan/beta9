@@ -63,7 +63,8 @@ func (g *Group) catalog() []mcpTool {
 		{
 			Name: "get_app",
 			Description: "One app: its config (resources, scaling, env, secret bindings, ports, disks) and URLs: url is " +
-				"the version's own, latest_url (or port_urls per port) follows new deployments.",
+				"the version's own, latest_url (or port_urls per port) follows new deployments. platform_env lists the " +
+				"variables set with set_env or connect_services, which every deploy keeps; the rest of the env comes from code.",
 			Schema: target,
 			Run:    g.getApp,
 		},
@@ -150,7 +151,9 @@ func (g *Group) catalog() []mcpTool {
 		},
 		{
 			Name: "set_env",
-			Description: "Set or remove environment variables on an app and deploy a new version. Values may be " +
+			Description: "Set or remove environment variables on an app and deploy a new version. Variables set here " +
+				"are kept by every later deploy, code pushes included, and override the same variable in code; unset " +
+				"removes them (a variable the code defines returns with the next code deploy). Values may be " +
 				"${{secret.NAME}}, ${{db.NAME.DATABASE_URL}} (or HOST, PORT, USERNAME, PASSWORD, DATABASE) or " +
 				"${{app.NAME.URL}} (one port of a multi-port app: ${{app.NAME.URL.<port>}}; its TLS host:port " +
 				"on the TCP gateway: ${{app.NAME.TCP.<port>}}).",
@@ -165,7 +168,7 @@ func (g *Group) catalog() []mcpTool {
 		{
 			Name: "connect_services",
 			Description: "Wire `target` to `source`: a database's URL and parts, or an app's URL, as env references on " +
-				"target; deploys a new version of target.",
+				"target; deploys a new version of target. Later deploys of target keep them, as with set_env.",
 			Schema: schema(props{
 				"source":             str("Database or app name"),
 				"target":             str("App that receives the variables"),
