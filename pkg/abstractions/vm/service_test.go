@@ -437,9 +437,13 @@ type vmBackend struct {
 	token        *types.Token
 	tokenError   error
 	deletedDisks int
+	unknown      string // the ID of a workspace that there is none of
 }
 
 func (b *vmBackend) GetWorkspaceByExternalId(_ context.Context, id string) (types.Workspace, error) {
+	if id == b.unknown && id != "" {
+		return types.Workspace{}, sql.ErrNoRows
+	}
 	return types.Workspace{Id: 7, ExternalId: id}, nil
 }
 
@@ -472,6 +476,7 @@ type vmRuntime struct {
 	memoryResponse  *pb.PodSandboxSnapshotMemoryResponse
 	guestAnswers    bool // the guest outlived a pause the worker refused
 	snapshotError   bool
+	freezeFailed    bool
 	snapshots       int
 	forwarded       string
 	diskName        string
@@ -481,6 +486,9 @@ type vmRuntime struct {
 	forwardStatus   int
 	forwardHeaders  http.Header
 	iceHandler      func(net.Conn)
+	// What the scheduler refuses every launch with, and how many it has.
+	refuse   error
+	refusals int
 }
 
 func (r *vmRuntime) SetVMICEHandler(handler func(net.Conn)) { r.iceHandler = handler }
@@ -497,6 +505,11 @@ func (r *vmRuntime) RunVM(_ context.Context, info *auth.AuthInfo, stub, cid stri
 	r.launchToken = info.Token.ExternalId
 	r.checkpoint = checkpoint
 	r.checkpointDisks = disks
+	if r.refuse != nil {
+		r.refusals++
+		return r.refuse
+	}
+
 	r.requests = append(r.requests, cid)
 	r.containers.states[cid] = &types.ContainerState{ContainerId: cid, StubId: stub, Status: types.ContainerStatusRunning}
 	return nil
@@ -524,6 +537,9 @@ func (r *vmRuntime) SandboxExposePort(_ context.Context, in *pb.PodSandboxExpose
 }
 func (r *vmRuntime) SandboxSnapshotDisks(_ context.Context, in *pb.PodSandboxSnapshotDisksRequest) (*pb.PodSandboxSnapshotDisksResponse, error) {
 	r.snapshots++
+	if r.freezeFailed {
+		return &pb.PodSandboxSnapshotDisksResponse{Ok: false, ErrorMsg: "freeze guest filesystem: I/O error", GuestFreezeFailed: true}, nil
+	}
 	if r.snapshotError {
 		return &pb.PodSandboxSnapshotDisksResponse{Ok: false, ErrorMsg: "upload failed"}, nil
 	}
@@ -537,10 +553,16 @@ type vmGateway struct {
 	// The root layer the last stub was asked for with, which no request carries.
 	layer *types.RootLayer
 	stops int
+	// What a stub is refused with, as billing refuses a workspace one.
+	refuse string
 }
 
 func (g *vmGateway) GetOrCreateStub(ctx context.Context, in *pb.GetOrCreateStubRequest) (*pb.GetOrCreateStubResponse, error) {
 	g.stub, g.layer = in, types.RootLayerFromContext(ctx)
+	if g.refuse != "" {
+		return &pb.GetOrCreateStubResponse{ErrMsg: g.refuse}, nil
+	}
+
 	return &pb.GetOrCreateStubResponse{Ok: true, StubId: uuid.NewString()}, nil
 }
 func (g *vmGateway) StopContainer(_ context.Context, in *pb.StopContainerRequest) (*pb.StopContainerResponse, error) {
@@ -710,6 +732,25 @@ func TestStopSnapshotFailureKeepsRuntimeAlive(t *testing.T) {
 	require.NotEmpty(t, v.ContainerID)
 }
 
+func TestStopWithStuckGuestUsesFinalRoot(t *testing.T) {
+	s, v, info, runtime, gateway := fixture()
+	v.RootSnapshotID = "previous-root"
+	runtime.freezeFailed = true
+	c, _ := actionContext(info, v.Name, "stop", `{}`)
+	require.NoError(t, s.action(c))
+
+	store := s.repo.(*vmStore)
+	stopped, err := store.GetVM(context.Background(), v.WorkspaceID, v.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.VMStateStopped, stopped.Status)
+	require.Empty(t, stopped.ContainerID)
+	require.Equal(t, "root-after-shutdown", stopped.RootSnapshotID)
+	require.Equal(t, 1, runtime.snapshots)
+	require.Equal(t, 1, gateway.stops)
+	require.Len(t, store.artifacts, 1)
+	require.Equal(t, stopped.RootSnapshotID, store.artifacts[0].RootSnapshotID)
+}
+
 func TestRemoveEndsAVMWhoseRootCannotBeSnapshotted(t *testing.T) {
 	s, v, info, runtime, gateway := fixture()
 	runtime.snapshotError = true
@@ -743,10 +784,12 @@ func TestFinalizationErrorOfAVMThatKeepsNoDisks(t *testing.T) {
 }
 
 func TestStopRejectsFinalSyncFailure(t *testing.T) {
-	s, v, info, _, _ := fixture()
+	s, v, info, runtime, gateway := fixture()
+	runtime.freezeFailed = true
 	s.containers.(*vmContainers).exitCode = int(types.ContainerExitCodeUnknownError)
 	err := s.stop(auth.ContextWithAuthInfo(context.Background(), info), v, false)
 	require.ErrorContains(t, err, "finalization error")
+	require.Equal(t, 1, gateway.stops)
 	require.NotEmpty(t, v.ContainerID)
 }
 

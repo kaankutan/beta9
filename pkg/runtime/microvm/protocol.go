@@ -108,6 +108,11 @@ type Spec struct {
 	// the file by the image's inodes, so this is for a root disk that is
 	// never restored: virtio-fs inodes change on a cold boot and on a fork.
 	RootMetacopy bool `json:"root_metacopy,omitempty"`
+	// RootVolatile has the guest send no flushes to the root disk, so an
+	// fsync waits for the host to take a write and not for the host's disk.
+	// A flush protects what is read back after a crash, so this is for a
+	// root disk that goes with its VM and is never read again.
+	RootVolatile bool `json:"root_volatile,omitempty"`
 	// CacheExport, when set, has the guest write what its workload added to
 	// its directories into its file as it shuts down.
 	CacheExport *CacheExport `json:"cache_export,omitempty"`
@@ -183,7 +188,7 @@ const (
 
 	// Host -> guest.
 	MsgSignal  = "signal"  // Payload: Signal to deliver to the container process.
-	MsgFreeze  = "freeze"  // FIFREEZE the filesystem at Text (a guest mount path; empty means the root disk).
+	MsgFreeze  = "freeze"  // FIFREEZE the filesystem at Text (a guest mount path; empty means the root disk), after those on loop devices.
 	MsgThaw    = "thaw"    // FITHAW the same.
 	MsgNetwork = "network" // Payload: Network and TimeUnixNano; restore addresses and wall time.
 	MsgRescan  = "rescan"  // Find PCI devices the host attached; the hypervisor's hotplug interrupt can precede the guest's handler.
@@ -217,6 +222,12 @@ const (
 // before thawing it itself: shorter than the host's request timeout, so a
 // freeze the host gave up on cannot outlive it.
 const FreezeLimit = 20 * time.Second
+
+// FreezeTimeout is how long the guest gives the kernel to freeze a filesystem
+// before it answers that the freeze failed. The kernel cannot give up on a
+// freeze, so the guest thaws it whenever it does finish. Shorter than the
+// host's request timeout, so the host hears the reason.
+const FreezeTimeout = 25 * time.Second
 
 // Filesystem operations the host performs inside the guest. The worker's
 // sandbox file RPCs use these because the guest's writable layer is a block

@@ -40,10 +40,6 @@ const (
 	controlDialTimeout = 30 * time.Second
 	controlDialBackoff = 50 * time.Millisecond
 	controlHeartbeat   = 2 * time.Second
-
-	// linux/fs.h: _IOWR('X', 119, int) and _IOWR('X', 120, int).
-	ioctlFIFREEZE = 0xC0045877
-	ioctlFITHAW   = 0xC0045878
 )
 
 func main() {
@@ -314,14 +310,28 @@ func enableWriteCache(device string) error {
 	return err
 }
 
+// rootDiskOptions are the ext4 options of the root disk. A flush protects
+// what is read back after a crash, and nothing reads a volatile root then, so
+// ext4 sends none: an fsync waits for the host to take the write and not for
+// the host's disk. The device's write cache is left as the host reports it,
+// and nobarrier covers a device that reports one.
+func rootDiskOptions(vm *microvm.Spec) string {
+	if vm.RootVolatile {
+		return "nobarrier"
+	}
+	return ""
+}
+
 func assembleRoot(vm *microvm.Spec) error {
 	if err := waitForDevice(vm.RootDisk); err != nil {
 		return err
 	}
-	if err := enableWriteCache(vm.RootDisk); err != nil {
-		return err
+	if !vm.RootVolatile {
+		if err := enableWriteCache(vm.RootDisk); err != nil {
+			return err
+		}
 	}
-	if err := unix.Mount(vm.RootDisk, microvm.DiskMount, "ext4", 0, ""); err != nil {
+	if err := unix.Mount(vm.RootDisk, microvm.DiskMount, "ext4", 0, rootDiskOptions(vm)); err != nil {
 		return fmt.Errorf("mount %s: %w", vm.RootDisk, err)
 	}
 	upper := filepath.Join(microvm.DiskMount, microvm.DiskOverlayUpper)
@@ -876,7 +886,7 @@ func (c *control) heartbeat(interval time.Duration) {
 // restored from a snapshot, so init reconnects and reports started again,
 // which makes the new host push the container's network config.
 func (c *control) serve(childPid func() int) {
-	fr := &freezer{frozen: map[string]*frozenFS{}}
+	fr := newFreezer()
 	gpu := newGPUCheckpointer()
 	dec := microvm.NewDecoder(c.current())
 	for {
@@ -991,67 +1001,6 @@ func (c *control) devicesArrived() {
 			close(c.devices)
 		}
 	})
-}
-
-// freezer holds the filesystems the host has frozen. A freeze the host never
-// thaws (it gave up waiting) is thawed here after microvm.FreezeLimit, so
-// root writes cannot hang for good.
-type freezer struct {
-	mu     sync.Mutex
-	frozen map[string]*frozenFS
-}
-
-type frozenFS struct {
-	dir   *os.File
-	timer *time.Timer
-}
-
-func (f *freezer) freeze(path string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, ok := f.frozen[path]; ok {
-		return nil
-	}
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := unix.IoctlSetInt(int(dir.Fd()), ioctlFIFREEZE, 0); err != nil {
-		dir.Close()
-		return err
-	}
-	f.frozen[path] = &frozenFS{dir: dir, timer: time.AfterFunc(microvm.FreezeLimit, func() {
-		if err := f.thaw(path); err == nil {
-			logf("thawed %s: no thaw request within %s", path, microvm.FreezeLimit)
-		}
-	})}
-	return nil
-}
-
-func (f *freezer) thaw(path string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	entry, ok := f.frozen[path]
-	if !ok {
-		return nil
-	}
-	entry.timer.Stop()
-	err := unix.IoctlSetInt(int(entry.dir.Fd()), ioctlFITHAW, 0)
-	entry.dir.Close()
-	delete(f.frozen, path)
-	return err
-}
-
-func (f *freezer) thawAll() {
-	f.mu.Lock()
-	paths := make([]string, 0, len(f.frozen))
-	for path := range f.frozen {
-		paths = append(paths, path)
-	}
-	f.mu.Unlock()
-	for _, path := range paths {
-		_ = f.thaw(path)
-	}
 }
 
 // --- guest services ----------------------------------------------------------

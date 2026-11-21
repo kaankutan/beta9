@@ -71,6 +71,8 @@ type ManagedEndpointsConfig struct {
 	Preemption  ManagedEndpointsPreemption    `key:"preemption" json:"preemption"`
 	Reconcile   ManagedEndpointsReconcile     `key:"reconcile" json:"reconcile"`
 	Routing     ManagedEndpointsRoutingConfig `key:"routing" json:"routing"`
+	// MaxReplicaMemoryMiB can raise the stub memory limit for managed endpoints.
+	MaxReplicaMemoryMiB uint32 `key:"maxReplicaMemoryMiB" json:"max_replica_memory_mib"`
 	// HeartbeatInterval is what replicas are told to heartbeat at.
 	HeartbeatInterval time.Duration `key:"heartbeatInterval" json:"heartbeat_interval"`
 	// ReplicaStaleAfter marks replicas failed when no heartbeat/probe arrives.
@@ -91,7 +93,6 @@ type ManagedEndpointsReconcile struct {
 }
 
 type ManagedEndpointsRoutingConfig struct {
-	SlowStartSeconds uint32 `key:"slowStartSeconds" json:"slow_start_seconds"`
 	// Cluster-wide in-flight caps, leased in Redis per request across every
 	// gateway; the engines' own bound is the replicas' MaxConcurrency.
 	PerWorkspaceConcurrency uint32 `key:"perWorkspaceConcurrency" json:"per_workspace_concurrency"`
@@ -118,9 +119,6 @@ func (c *ManagedEndpointsConfig) ApplyDefaults() {
 		c.ReplicaStaleAfter = 3 * c.HeartbeatInterval
 	}
 	c.ReplicaStaleAfter = max(c.ReplicaStaleAfter, 2*c.HeartbeatInterval)
-	if c.Routing.SlowStartSeconds == 0 {
-		c.Routing.SlowStartSeconds = 30
-	}
 	for _, d := range []struct {
 		v   *time.Duration
 		def time.Duration
@@ -763,18 +761,19 @@ type WorkerPoolConfig struct {
 	// so they move on to the next pool in their route. Unset, the pool never
 	// counts as stalled and its requests wait.
 	StalledAfter Duration `key:"stalledAfter" json:"stalled_after,omitempty"`
-	// Provisioning makes the pool buy its machines from one provider. With
+	// Provisioning makes the pool buy its machines from providers. With
 	// poolSizing.minFree* the pool keeps that much free, and with alsoServes
 	// it takes overflow, like any other pool.
 	Provisioning WorkerPoolProvisioningConfig `key:"provisioning" json:"provisioning,omitzero"`
 }
 
 // WorkerPoolProvisioningConfig is where and how a pool buys machines.
-// Provider and MaxNodes are required.
+// Providers and MaxNodes are required.
 //
-// A pool that buys up to four spot L40S machines from Verda, keeps one GPU
-// free and takes the overflow of the A10G pools. Below it, what all such
-// pools together may spend, and the credentials of two providers:
+// A pool that buys up to four spot L40S machines from Verda, with no more
+// than four GPUs between them, keeps one GPU free and takes the overflow of
+// the A10G pools. Below it, what all such pools together may spend, and the
+// credentials of two providers:
 //
 //	worker:
 //	  pools:
@@ -782,9 +781,10 @@ type WorkerPoolConfig struct {
 //	      gpuType: L40S
 //	      alsoServes: [A10G]
 //	      provisioning:
-//	        provider: verda
+//	        providers: [verda]
 //	        spot: true
 //	        maxNodes: 4
+//	        maxGPUs: 4
 //	        maxNodeHourlyCents: 150
 //	        regions: [FIN-01]
 //	        idleTimeout: 10m
@@ -804,14 +804,22 @@ type WorkerPoolConfig struct {
 //	    projects:
 //	    - id:
 type WorkerPoolProvisioningConfig struct {
-	// Provider is the key under providers that the machines are bought from.
-	Provider string `key:"provider" json:"provider"`
+	// Providers are the keys under providers that the machines are bought
+	// from: each from whichever is expected to cost least.
+	Providers []string `key:"providers" json:"providers"`
 	// Spot buys machines the provider may take back, which makes the pool
 	// preemptable. Without it the pool buys on-demand machines.
 	Spot bool `key:"spot" json:"spot,omitempty"`
+	// OnDemand has a spot pool buy on-demand machines too, when they are
+	// expected to cost less or work that may not be interrupted waits. The
+	// pool then takes such work.
+	OnDemand bool `key:"onDemand" json:"on_demand,omitempty"`
 	// MaxNodes is the most machines the pool holds, counting those that are
 	// still booting.
 	MaxNodes int `key:"maxNodes" json:"max_nodes"`
+	// MaxGPUs is the most GPUs the pool holds across all its machines,
+	// including machines still booting or being deleted. Zero means no cap.
+	MaxGPUs int `key:"maxGPUs" json:"max_gpus,omitempty"`
 	// MaxNodeHourlyCents is the most one machine may cost per hour. Zero
 	// means any price.
 	MaxNodeHourlyCents int64 `key:"maxNodeHourlyCents" json:"max_node_hourly_cents,omitempty"`
@@ -853,18 +861,30 @@ func (p WorkerPoolProvisioningConfig) BootWithin() time.Duration {
 // written reports whether the config file or the API set anything in the
 // block.
 func (p WorkerPoolProvisioningConfig) written() bool {
-	return p.Provider != "" || p.Spot || p.MaxNodes != 0 || p.MaxNodeHourlyCents != 0 ||
+	return len(p.Providers) > 0 || p.Spot || p.OnDemand || p.MaxNodes != 0 || p.MaxGPUs != 0 || p.MaxNodeHourlyCents != 0 ||
 		len(p.Regions) > 0 || p.IdleTimeout != 0 || p.BootTimeout != 0
 }
 
 // Buys reports whether the pool buys its machines from a provider.
 func (c WorkerPoolConfig) Buys() bool {
-	return c.Provisioning.Provider != ""
+	return len(c.Provisioning.Providers) > 0
+}
+
+// AllowsManagedEndpointSpot checks the pool's explicit endpoint and Spot policies.
+func (c WorkerPoolConfig) AllowsManagedEndpointSpot() bool {
+	if !c.ManagedEndpoints.Enabled {
+		return false
+	}
+	if c.Buys() {
+		return c.Provisioning.Spot && !c.Provisioning.OnDemand
+	}
+	return c.Preemptable
 }
 
 // ApplyProvisioning fills in what a provisioning block implies. Machines that
 // are bought join through the agent, so the pool needs no mode. Spot machines
-// can be taken back, so the pool takes only work that may be interrupted.
+// can be taken back, so a pool that buys nothing else takes only work that
+// may be interrupted.
 func (c *WorkerPoolConfig) ApplyProvisioning() {
 	if !c.Buys() {
 		return
@@ -872,7 +892,7 @@ func (c *WorkerPoolConfig) ApplyProvisioning() {
 	if c.Mode == "" {
 		c.Mode = PoolModeExternal
 	}
-	if c.Provisioning.Spot {
+	if c.Provisioning.Spot && !c.Provisioning.OnDemand {
 		c.Preemptable = true
 	}
 }
@@ -931,10 +951,16 @@ func (c WorkerPoolConfig) validateProvisioning() error {
 	switch {
 	case !p.written():
 		return nil
-	case strings.TrimSpace(p.Provider) == "":
-		return fmt.Errorf("provisioning needs a provider: the key under providers to buy machines from")
+	case len(p.Providers) == 0 || slices.ContainsFunc(p.Providers, func(name string) bool { return strings.TrimSpace(name) == "" }):
+		return fmt.Errorf("provisioning needs a provider: provisioning.providers lists the keys under providers to buy machines from")
+	case p.OnDemand && !p.Spot:
+		return fmt.Errorf("provisioning.onDemand goes with provisioning.spot: without spot the pool buys on-demand machines already")
 	case p.MaxNodes < 1:
 		return fmt.Errorf("provisioning.maxNodes must be at least 1: it is the most machines the pool may hold")
+	case p.MaxGPUs < 0:
+		return fmt.Errorf("provisioning.maxGPUs cannot be negative")
+	case p.MaxGPUs > 0 && strings.TrimSpace(c.GPUType) == "":
+		return fmt.Errorf("provisioning.maxGPUs needs a gpuType: a CPU pool has no GPUs to cap")
 	case p.MaxNodeHourlyCents < 0:
 		return fmt.Errorf("provisioning.maxNodeHourlyCents cannot be negative")
 	case c.Mode != "" && c.Mode != PoolModeExternal:
@@ -1636,14 +1662,17 @@ type VMConfig struct {
 }
 
 // GitHubRunnerConfig runs GitHub Actions jobs on ordinary CPU VMs through a
-// GitHub App. An empty AppID disables it; with one, every other field is
-// required.
+// GitHub App. An empty AppID disables it; with one, the App credentials,
+// webhook secret, and runner image are required.
 //
-// The App needs Actions (write, to cancel runs) and Administration (write) on
+// The App needs Actions (write, to cancel runs) and Metadata (read) on
 // repositories, Members (read) on organizations, and Workflow job events sent
-// to the gateway's /api/v1/vm/github-runners/webhook. Its setup URL, with
-// redirect on update, and its callback URL are both the dashboard's /vms
-// page; leave "Request user authorization (OAuth) during installation" off.
+// to the gateway's /api/v1/vm/github-runners/webhook. To register runners it
+// needs Administration (write) on repositories, or Self-hosted runners
+// (write) on organizations for those that OrganizationRunners covers. Its
+// setup URL, with redirect on update, and its callback URL are both the
+// dashboard's /vms page; leave "Request user authorization (OAuth) during
+// installation" off.
 type GitHubRunnerConfig struct {
 	AppID   string `key:"appID" json:"app_id"`
 	AppSlug string `key:"appSlug" json:"app_slug"` // as in github.com/apps/<slug>
@@ -1661,6 +1690,21 @@ type GitHubRunnerConfig struct {
 	// it stay queued on GitHub, and get theirs as runners finish, the jobs
 	// that have waited longest first. Zero or less sets no limit.
 	RunnerLimit int `key:"runnerLimit" json:"runner_limit"`
+	// LabelPrefix replaces "beam-" in workflow size labels. Empty uses
+	// "beam-"; values are trimmed and lowercased. Other prefixes starting
+	// with "beam-" are rejected because production runners recognize them
+	// too. Staging tests that share repositories with production must use
+	// a prefix outside "beam-", so the production App ignores their jobs.
+	LabelPrefix string `key:"labelPrefix" json:"label_prefix"`
+	// OrganizationRunners registers the runners of an organization on the
+	// organization, in a runner group that only their repository can use,
+	// which takes Self-hosted runners (write) there and no Administration of
+	// its repositories. Each organization changes over once it has granted
+	// that: one that installed the App before the App asked for it has to
+	// accept first, and registers runners on its repositories until then, as
+	// a personal account always does. Administration can come off the App
+	// when no account that is to keep its runners still depends on it.
+	OrganizationRunners bool `key:"organizationRunners" json:"organization_runners"`
 }
 
 // VMWebRTCConfig bounds authenticated kiosk media on the shared TCP gateway.
