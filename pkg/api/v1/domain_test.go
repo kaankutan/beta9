@@ -826,3 +826,43 @@ func TestVerifyCustomDomainDNSSlowTXTDoesNotStarveOtherChecks(t *testing.T) {
 	require.True(t, ok)
 	require.Less(t, time.Since(start), 2*time.Second, "a hanging TXT lookup must not delay the other proofs")
 }
+
+func TestDomainGroupCreateAsksTheGate(t *testing.T) {
+	e := echo.New()
+	repo := newDomainTestBackendRepo()
+	group := newDomainGroupForTest(repo, &domainTestDNSResolver{})
+
+	allow := false
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.Equal(t, "ws-1", req["workspace_id"])
+		if allow {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":false,"message":"Custom domains are available on the Team plan."}`))
+	}))
+	t.Cleanup(gate.Close)
+	group.config.GatewayService.HTTP.DomainGateURL = gate.URL
+
+	create := func() (*httptest.ResponseRecorder, error) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/domain/ws-1", strings.NewReader(`{"domain":"api.customer.io","deployment_name":"my-api"}`))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		return rec, group.Create(domainAuthContext(e, req, rec, []string{"workspaceId"}, []string{"ws-1"}))
+	}
+
+	_, err := create()
+	var httpErr *echo.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.StatusForbidden, httpErr.Code)
+	require.Contains(t, fmt.Sprint(httpErr.Message), "Team plan")
+	require.Empty(t, repo.domains)
+
+	allow = true
+	rec, err := create()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Len(t, repo.domains, 1)
+}

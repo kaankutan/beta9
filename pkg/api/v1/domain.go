@@ -433,6 +433,10 @@ func (g *DomainGroup) Create(ctx echo.Context) error {
 		return HTTPBadRequest("port can only be specified for pod deployments")
 	}
 
+	if msg := common.CheckCustomDomainAccess(ctx.Request().Context(), g.config.GatewayService.HTTP, workspace.ExternalId); msg != "" {
+		return HTTPForbidden(msg)
+	}
+
 	token, err := repository.GenerateCustomDomainVerificationToken()
 	if err != nil {
 		return HTTPInternalServerError("Failed to generate verification token")

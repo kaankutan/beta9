@@ -345,6 +345,8 @@ func (wpc *LocalKubernetesWorkerPoolController) workerPodConfig() types.AppConfi
 	config.ImageService.BuildRegistryCredentials = types.BuildRegistryCredentialsConfig{}
 	config.ImageService.Registries.Docker = types.DockerImageRegistryConfig{}
 	config.GatewayService.CreditGate = types.CreditGateConfig{}
+	config.GatewayService.HTTP.DomainCheckToken = ""
+	config.GatewayService.HTTP.DomainGateToken = ""
 	config.Providers = types.ProviderConfig{}
 	config.Tailscale = types.TailscaleConfig{}
 	config.Monitoring.Prometheus.AgentPassword = ""

@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -764,4 +767,71 @@ func TestDeployStubCustomDomainSyncFailureAndStaleDeploy(t *testing.T) {
 	require.Empty(t, stale.upserted)
 	require.Len(t, stale.listedDomains, 1)
 	require.Equal(t, "newer.customer.io", stale.listedDomains[0].Domain)
+}
+
+// A deploy asks the custom domain gate only when it adds a domain, so a
+// workspace that lost the feature still redeploys with the domains it has.
+func TestDeployStubCustomDomainGate(t *testing.T) {
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{Id: 1, ExternalId: "ws-1", Name: "default"},
+	})
+	rdb, err := repository.NewRedisClientForTest()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	var calls atomic.Int32
+	allow := atomic.Bool{}
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if allow.Load() {
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":false,"message":"Custom domains are available on the Team plan."}`))
+	}))
+	t.Cleanup(gate.Close)
+
+	deploy := func(cfg string, existing map[string]*types.CustomDomain) (*pb.DeployStubResponse, *deployStubCustomDomainRepo) {
+		repo := &deployStubCustomDomainRepo{
+			stub: &types.StubWithRelated{
+				Stub:      types.Stub{Id: 1, ExternalId: "stub-gate", Type: types.StubType(types.StubTypeEndpointDeployment), Config: cfg},
+				Workspace: types.Workspace{Id: 1, ExternalId: "ws-1"},
+			},
+			existingDomains: existing,
+		}
+		svc := &GatewayService{backendRepo: repo, redisClient: rdb}
+		svc.appConfig.GatewayService.HTTP.DomainGateURL = gate.URL
+		resp, err := svc.DeployStub(ctx, &pb.DeployStubRequest{StubId: "stub-gate", Name: "my-api"})
+		require.NoError(t, err)
+		return resp, repo
+	}
+	withDomain := `{"extra":{"custom_domain":["api.customer.io"]}}`
+
+	// A new domain is refused with the gate's message, before any deployment is created.
+	resp, repo := deploy(withDomain, nil)
+	require.False(t, resp.Ok)
+	require.Equal(t, "Custom domains are available on the Team plan.", resp.ErrMsg)
+	require.Empty(t, repo.created)
+	require.Empty(t, repo.upserted)
+	require.Equal(t, int32(1), calls.Load())
+
+	// A domain already bound to this deployment needs no gate.
+	resp, repo = deploy(withDomain, map[string]*types.CustomDomain{
+		"api.customer.io": {WorkspaceId: 1, Domain: "api.customer.io", DeploymentName: "my-api", StubType: types.StubTypeEndpointDeployment},
+	})
+	require.True(t, resp.Ok, resp.ErrMsg)
+	require.Len(t, repo.upserted, 1)
+	require.Equal(t, int32(1), calls.Load())
+
+	// Nor does a deploy without domains.
+	resp, _ = deploy(`{}`, nil)
+	require.True(t, resp.Ok, resp.ErrMsg)
+	require.Equal(t, int32(1), calls.Load())
+
+	// A workspace the gate allows binds its new domain.
+	allow.Store(true)
+	resp, repo = deploy(withDomain, nil)
+	require.True(t, resp.Ok, resp.ErrMsg)
+	require.Len(t, repo.upserted, 1)
+	require.Equal(t, int32(2), calls.Load())
 }

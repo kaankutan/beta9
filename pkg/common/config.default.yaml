@@ -82,6 +82,11 @@ gateway:
     domainCheckAllowUnauthenticated: false
     # Extra hostnames (e.g. load balancer DNS names) never treated as custom domains.
     reservedHosts: []
+    # When set, asked whether a workspace may add a custom domain:
+    # POST {"workspace_id": "...", "feature": "custom_domains"} -> {"ok": bool, "message": "..."}.
+    # Empty lets every workspace add custom domains.
+    domainGateURL: ""
+    domainGateToken: ""
     cors:
       allowOrigins: "*"
       allowHeaders: "*"

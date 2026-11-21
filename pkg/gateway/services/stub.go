@@ -1092,6 +1092,7 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 			}
 		}
 	}
+	addsCustomDomain := false
 	for _, domain := range customDomains {
 		if err := common.ValidateCustomDomainName(domain, common.ReservedDomains(gws.appConfig)...); err != nil {
 			return &pb.DeployStubResponse{
@@ -1108,6 +1109,16 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 				Ok:     false,
 				ErrMsg: fmt.Sprintf("Custom domain %q is already bound to deployment %q", domain, existing.DeploymentName),
 			}, nil
+		}
+		if existing == nil {
+			addsCustomDomain = true
+		}
+	}
+	// Only a deploy that adds a domain asks the gate, so a workspace that lost
+	// the feature can still redeploy with the domains it already has.
+	if addsCustomDomain {
+		if msg := common.CheckCustomDomainAccess(ctx, gws.appConfig.GatewayService.HTTP, authInfo.Workspace.ExternalId); msg != "" {
+			return &pb.DeployStubResponse{Ok: false, ErrMsg: msg}, nil
 		}
 	}
 

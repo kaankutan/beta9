@@ -245,6 +245,14 @@ type HTTPConfig struct {
 	// ReservedHosts are additional platform hostnames (e.g. load balancer or
 	// internal service names) that must never be treated as custom domains.
 	ReservedHosts []string `key:"reservedHosts" json:"reserved_hosts"`
+	// DomainGateURL, when set, is asked whether a workspace may add a custom
+	// domain: POST {"workspace_id", "feature": "custom_domains"} answered with
+	// {"ok", "message"}. Empty lets every workspace add domains (self-hosted
+	// default). The gate decides which workspaces have the feature, so plans
+	// stay outside beta9.
+	DomainGateURL string `key:"domainGateURL" json:"domain_gate_url"`
+	// DomainGateToken is sent to DomainGateURL as Authorization: Bearer.
+	DomainGateToken string `key:"domainGateToken" json:"domain_gate_token"`
 }
 
 func (h *HTTPConfig) GetExternalURL() string {
