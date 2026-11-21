@@ -27,7 +27,7 @@ func openIntegrationPostgresRepo(t *testing.T) *PostgresBackendRepository {
 		_ = db.Close()
 	})
 
-	// Reset public schema so MigrateContext runs every migration (001..071) from scratch.
+	// Reset public schema so MigrateContext runs every migration (001..074) from scratch.
 	_, err = db.Exec(`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 	require.NoError(t, err)
 
@@ -41,7 +41,7 @@ func openIntegrationPostgresRepo(t *testing.T) *PostgresBackendRepository {
 	ctx := context.Background()
 	require.NoError(t, repo.MigrateContext(ctx))
 
-	// Also verify migration 071 down + up roundtrip cleanly against live Postgres.
+	// Also verify migration 074 (the latest) down + up roundtrip cleanly against live Postgres.
 	require.NoError(t, goose.DownContext(ctx, db.DB, "./"))
 	require.NoError(t, goose.UpContext(ctx, db.DB, "./"))
 
