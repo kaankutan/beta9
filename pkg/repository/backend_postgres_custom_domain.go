@@ -371,6 +371,17 @@ func (r *PostgresBackendRepository) GetActiveCustomDomainByDomain(ctx context.Co
 	return &cd, nil
 }
 
+// ListActiveCustomDomainNames returns the name of every verified custom domain
+// in every workspace. Host routing keeps them in memory so that hosts which
+// are not active custom domains never cause a database lookup.
+func (r *PostgresBackendRepository) ListActiveCustomDomainNames(ctx context.Context) ([]string, error) {
+	names := []string{}
+	if err := r.client.SelectContext(ctx, &names, `SELECT domain FROM custom_domain WHERE status = 'active';`); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
 func (r *PostgresBackendRepository) ListCustomDomains(ctx context.Context, workspaceId uint, deploymentName string) ([]types.CustomDomain, error) {
 	query := `
 		SELECT ` + customDomainSelectColumns + `

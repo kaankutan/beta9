@@ -1110,6 +1110,20 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 				ErrMsg: fmt.Sprintf("Custom domain %q is already bound to deployment %q", domain, existing.DeploymentName),
 			}, nil
 		}
+		// A domain pinned to one version (e.g. added with --deployment-id) keeps
+		// routing to that version, which this deploy is about to replace. Binding
+		// it from code would report success and then 404 once the pinned version
+		// stops, so refuse before anything is stopped or created.
+		if existing != nil && existing.Version != 0 {
+			return &pb.DeployStubResponse{
+				Ok: false,
+				ErrMsg: fmt.Sprintf(
+					"Custom domain %q is pinned to version %d of %q and would not follow this deploy. "+
+						"Remove the domain and deploy again to have it follow the latest version, or take it out of custom_domain to keep the pin.",
+					domain, existing.Version, in.Name,
+				),
+			}, nil
+		}
 		if existing == nil {
 			addsCustomDomain = true
 		}
@@ -1151,7 +1165,11 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 		if len(deploymentsToStop) == 0 && rolloutLatestDeployment != nil {
 			deploymentsToStop = []types.DeploymentWithRelated{*rolloutLatestDeployment}
 		}
-		if err := gws.stopDeployments(deploymentsToStop, ctx); err != nil {
+		// Only mark the previous versions inactive for now. Their containers keep
+		// running until the new deployment and its custom domains are saved, so
+		// a deploy that fails before then reactivates them without a cold start.
+		if err := gws.deactivateDeployments(ctx, deploymentsToStop); err != nil {
+			gws.reactivateDeployments(ctx, deploymentsToStop)
 			return &pb.DeployStubResponse{
 				Ok:     false,
 				ErrMsg: "Unable to stop previous deployment before rollout",
@@ -1161,15 +1179,32 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 
 	deployment, err := gws.backendRepo.CreateDeployment(ctx, authInfo.Workspace.Id, in.Name, version, stub.Id, string(stub.Type), stub.AppId)
 	if err != nil {
+		gws.reactivateDeployments(ctx, deploymentsToStop)
 		return &pb.DeployStubResponse{
 			Ok: false,
 		}, nil
 	}
 
+	// rollBack undoes this deploy after the new deployment was created: it
+	// removes the new deployment and reactivates the previous versions.
+	rollBack := func(errMsg string) *pb.DeployStubResponse {
+		var rollbackFailures []string
+		if rbErr := gws.backendRepo.DeleteDeployment(ctx, *deployment); rbErr != nil {
+			log.Error().Err(rbErr).Str("deployment_id", deployment.ExternalId).Msg("failed to roll back deployment")
+			rollbackFailures = append(rollbackFailures, fmt.Sprintf("new deployment %s could not be removed", deployment.ExternalId))
+		}
+		rollbackFailures = append(rollbackFailures, gws.reactivateDeployments(ctx, deploymentsToStop)...)
+		gws.invalidateDeploymentCustomDomains(ctx, authInfo.Workspace.Id, in.Name)
+		if len(rollbackFailures) > 0 {
+			errMsg += fmt.Sprintf(" (rollback incomplete: %s; check your deployments)", strings.Join(rollbackFailures, "; "))
+		}
+		return &pb.DeployStubResponse{Ok: false, ErrMsg: errMsg}
+	}
+
 	// Domains are synced atomically after deployment creation: binding the
 	// declared domains and pruning the removed ones happen in one transaction.
-	// Any failure rolls back the new deployment and reactivates stopped versions
-	// instead of reporting success with domains in an unknown state.
+	// Any failure rolls back the new deployment and reactivates the previous
+	// versions instead of reporting success with domains in an unknown state.
 	if types.SupportsCustomDomain(stub.Type) {
 		domainsToBind := make([]*types.CustomDomain, 0, len(customDomains))
 		for _, domain := range customDomains {
@@ -1185,29 +1220,7 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 		synced, err := gws.backendRepo.SyncDeployCustomDomains(ctx, authInfo.Workspace.Id, in.Name, string(stub.Type), deployment.Version, domainsToBind)
 		if err != nil {
 			log.Error().Err(err).Str("deployment", in.Name).Msg("failed to sync custom domains; rolling back deployment")
-			var rollbackFailures []string
-			if rbErr := gws.backendRepo.DeleteDeployment(ctx, *deployment); rbErr != nil {
-				log.Error().Err(rbErr).Str("deployment_id", deployment.ExternalId).Msg("failed to roll back deployment")
-				rollbackFailures = append(rollbackFailures, fmt.Sprintf("new deployment %s could not be removed", deployment.ExternalId))
-			}
-			for _, prev := range deploymentsToStop {
-				prev.Deployment.Active = true
-				if _, restoreErr := gws.backendRepo.UpdateDeployment(ctx, prev.Deployment); restoreErr != nil {
-					log.Error().Err(restoreErr).Str("deployment_id", prev.ExternalId).Msg("failed to restore previous deployment")
-					rollbackFailures = append(rollbackFailures, fmt.Sprintf("previous deployment %s could not be reactivated", prev.ExternalId))
-				} else {
-					gws.reloadInstances(prev.Stub.ExternalId, prev.StubType)
-				}
-			}
-			gws.invalidateDeploymentCustomDomains(ctx, authInfo.Workspace.Id, in.Name)
-			errMsg := fmt.Sprintf("Failed to bind custom domains: %v", err)
-			if len(rollbackFailures) > 0 {
-				errMsg += fmt.Sprintf(" (rollback incomplete: %s; check your deployments)", strings.Join(rollbackFailures, "; "))
-			}
-			return &pb.DeployStubResponse{
-				Ok:     false,
-				ErrMsg: errMsg,
-			}, nil
+			return rollBack(fmt.Sprintf("Failed to bind custom domains: %v", err)), nil
 		}
 		if synced.Stale {
 			// A newer deploy of this deployment already owns the bindings.
@@ -1215,6 +1228,15 @@ func (gws *GatewayService) DeployStub(ctx context.Context, in *pb.DeployStubRequ
 		} else if len(synced.Pruned) > 0 {
 			common.InvalidateCustomDomainCache(ctx, gws.redisClient, common.CustomDomainNames(synced.Pruned)...)
 		}
+	}
+
+	// The new deployment and its domains are saved: stop the previous versions'
+	// containers before the new version starts (a writable durable disk can be
+	// attached to only one of them). If that fails, the deploy is undone as
+	// before; custom domain bindings already follow this deploy's declaration.
+	if err := gws.stopDeactivatedDeployments(ctx, deploymentsToStop); err != nil {
+		log.Error().Err(err).Str("deployment", in.Name).Msg("failed to stop previous deployment; rolling back deployment")
+		return rollBack("Unable to stop previous deployment before rollout"), nil
 	}
 	gws.invalidateDeploymentCustomDomains(ctx, authInfo.Workspace.Id, in.Name)
 

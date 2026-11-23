@@ -333,13 +333,13 @@ func (g *Gateway) registerHTTPMiddleware(e *echo.Echo) {
 	baseDomain := gatewaymiddleware.ParseHostFromURL(g.Config.GatewayService.HTTP.GetExternalURL())
 
 	skipSubdomainRoutes := func(c echo.Context) bool {
-		subdomain := gatewaymiddleware.ParseSubdomain(c.Request().Host, baseDomain)
-		if subdomain != "" {
-			return true
-		}
-		return gatewaymiddleware.IsCandidateCustomDomain(c.Request().Host, baseDomain, reservedDomains...)
+		return gatewaymiddleware.ParseSubdomain(c.Request().Host, baseDomain) != ""
 	}
 
+	// Hosts that may be custom domains still get their trailing slash removed
+	// (most of them are not bound and fall through to API routing); a bound
+	// custom domain forwards the path recorded here instead.
+	e.Pre(gatewaymiddleware.PreserveCustomDomainPath(g.Config.GatewayService.HTTP.GetExternalURL(), reservedDomains))
 	e.Pre(middleware.RemoveTrailingSlashWithConfig(middleware.TrailingSlashConfig{
 		Skipper: skipSubdomainRoutes,
 	}))

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/beam-cloud/beta9/pkg/auth"
@@ -23,6 +24,7 @@ import (
 	"github.com/beam-cloud/beta9/pkg/types/serializer"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
@@ -113,6 +115,18 @@ const domainCheckClusterWindow = time.Minute
 // requests per client per window, across all replicas (var so tests can lower it)
 var domainCheckClusterLimit int64 = 1200
 
+// incrWithWindowScript counts a request and starts the window on the first
+// one in a single step: with INCR and EXPIRE sent separately, a failed EXPIRE
+// left a counter without a TTL that rate-limited its client forever. A
+// counter that somehow has no TTL is given one on its next request.
+var incrWithWindowScript = redis.NewScript(`
+local count = redis.call('INCR', KEYS[1])
+if count == 1 or redis.call('PTTL', KEYS[1]) < 0 then
+	redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return count
+`)
+
 // clusterRateLimit caps /check per client across gateway replicas using Redis.
 // The in-memory limiter is per replica; this one is shared. It fails open when
 // Redis is unavailable so a Redis outage cannot block certificate issuance.
@@ -123,12 +137,9 @@ func (g *DomainGroup) clusterRateLimit(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 		key := fmt.Sprintf("api:custom_domain:check:rl:%s", rateLimitClientKey(ctx))
 		reqCtx := ctx.Request().Context()
-		count, err := g.redisClient.Incr(reqCtx, key).Result()
+		count, err := incrWithWindowScript.Run(reqCtx, g.redisClient, []string{key}, domainCheckClusterWindow.Milliseconds()).Int64()
 		if err != nil {
 			return next(ctx)
-		}
-		if count == 1 {
-			_ = g.redisClient.Expire(reqCtx, key, domainCheckClusterWindow).Err()
 		}
 		if count > domainCheckClusterLimit {
 			return ctx.NoContent(http.StatusTooManyRequests)
@@ -203,13 +214,12 @@ func (g *DomainGroup) enrichCustomDomain(cd *types.CustomDomain) {
 	if cd == nil {
 		return
 	}
-	baseDomain := g.baseDomain()
 	cd.TXTRecordName = "_beta9-challenge." + cd.Domain
-	// Only a deployment-specific target is accepted; the bare base domain is
-	// shared by everyone, so pointing at it proves nothing.
-	if cd.Subdomain != "" && baseDomain != "" {
-		cd.CNAMETarget = fmt.Sprintf("%s.%s", cd.Subdomain, baseDomain)
-	}
+	// The CNAME target is unique to this workspace and domain. A shared host (the
+	// base domain, or a deployment subdomain whose short hash another workspace
+	// can collide) would let others pass the CNAME check for a domain they do
+	// not control.
+	cd.CNAMETarget = common.CustomDomainCNAMETarget(cd.WorkspaceId, cd.Domain, g.baseDomain())
 	cd.URL = common.BuildCustomDomainURL(g.config.GatewayService.HTTP.GetExternalURL(), cd.Domain)
 }
 
@@ -579,8 +589,8 @@ func verifyCustomDomainDNS(ctx context.Context, resolver domainDNSResolver, cd *
 	target := common.NormalizeDomain(cd.CNAMETarget)
 
 	// Ownership is proven only by the claim's own TXT token or by a CNAME to
-	// this deployment's own target. Matching IP addresses is deliberately not
-	// accepted: deployment targets share gateway addresses, so any domain that
+	// the claim's own target. Matching IP addresses is deliberately not
+	// accepted: all targets share gateway addresses, so any domain that
 	// already points at the gateway would pass for every workspace.
 	//
 	// Each proof runs concurrently with its own deadline. A resolver that is
@@ -607,17 +617,28 @@ func verifyCustomDomainDNS(ctx context.Context, resolver domainDNSResolver, cd *
 				if err != nil {
 					return false
 				}
-				// Must point at this deployment's own target, not any host under the base domain.
+				// Must point at this claim's own target, not any host under the base domain.
 				normalized := common.NormalizeDomain(cname)
 				return normalized != "" && normalized == target
 			},
 		)
 	}
 
+	// Once one proof passes, the remaining lookups are cancelled; no lookup
+	// outlives this call.
+	checkCtx, cancelChecks := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		cancelChecks()
+		wg.Wait()
+	}()
+
 	results := make(chan bool, len(checks))
 	for _, check := range checks {
+		wg.Add(1)
 		go func(check func(ctx context.Context) bool) {
-			dnsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer wg.Done()
+			dnsCtx, cancel := context.WithTimeout(checkCtx, 5*time.Second)
 			defer cancel()
 			results <- check(dnsCtx)
 		}(check)

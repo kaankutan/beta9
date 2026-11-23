@@ -6,14 +6,15 @@ from unittest.mock import MagicMock
 
 from click.testing import CliRunner
 
+# websocket is stubbed before beta9 is imported, so these imports cannot move to the top.
 sys.modules.setdefault("websocket", MagicMock())
 
-from beta9 import Image, Pod, Service, asgi, endpoint, function, realtime, task_queue
-from beta9.channel import GatewayHTTPError
-from beta9.cli import deployment as deployment_cli
-from beta9.cli import domain as domain_cli
-from beta9.cli import extraclick
-from beta9.cli.main import load_cli
+from beta9 import Image, Pod, Service, asgi, endpoint, function, realtime, task_queue  # noqa: E402
+from beta9.channel import GatewayHTTPError  # noqa: E402
+from beta9.cli import deployment as deployment_cli  # noqa: E402
+from beta9.cli import domain as domain_cli  # noqa: E402
+from beta9.cli import extraclick  # noqa: E402
+from beta9.cli.main import load_cli  # noqa: E402
 
 
 class FakeHTTPClient:
@@ -46,7 +47,9 @@ class TestDomainCLI(TestCase):
             mock.patch.object(
                 extraclick,
                 "get_config_context",
-                return_value=SimpleNamespace(token="tok", gateway_host="localhost", gateway_port=1993),
+                return_value=SimpleNamespace(
+                    token="tok", gateway_host="localhost", gateway_port=1993
+                ),
             ),
             mock.patch.object(
                 extraclick,
@@ -78,7 +81,7 @@ class TestDomainCLI(TestCase):
             "status": "pending",
             "verification_token": "beta9-verify-abc",
             "txt_record_name": "_beta9-challenge.api.customer.io",
-            "cname_target": "my-api-1234567.app.example.com",
+            "cname_target": "cd-0123456789abcdef0123456789abcdef.app.example.com",
             "url": "https://api.customer.io",
         }
 
@@ -287,7 +290,9 @@ class TestDomainSDKAbstractions(TestCase):
                 )
             ),
             get_url=MagicMock(
-                return_value=MagicMock(ok=True, url="https://pod-app-1234567-latest-8000.app.example.com")
+                return_value=MagicMock(
+                    ok=True, url="https://pod-app-1234567-latest-8000.app.example.com"
+                )
             ),
         ),
     )
@@ -302,6 +307,26 @@ class TestDomainSDKAbstractions(TestCase):
         resp, ok = pod.deploy()
         self.assertTrue(ok)
         self.assertEqual(resp["custom_domains"], ["pod.example.com"])
+
+    def test_custom_domain_hint_points_at_domain_get(self):
+        # `domain list` shows no DNS records, so the deploy output must send
+        # users to `domain get`, which shows the TXT and CNAME records.
+        @endpoint(name="ep-app", custom_domain="api.example.com")
+        def single():
+            return {"ok": True}
+
+        @asgi(name="asgi-app", custom_domain=["a.example.com", "b.example.com"])
+        def several(scope, receive, send):
+            pass
+
+        hint = single.parent._custom_domain_dns_hint()
+        self.assertIn("domain get api.example.com", hint)
+        self.assertIn("domain verify api.example.com", hint)
+        self.assertNotIn("domain list", hint)
+
+        hint = several.parent._custom_domain_dns_hint()
+        self.assertIn("domain get <domain>", hint)
+        self.assertIn("domain verify <domain>", hint)
 
     def test_cli_override_and_service_generation_forward_custom_domain(self):
         @endpoint(name="ep-app")
@@ -395,7 +420,9 @@ class TestDomainSDKAbstractions(TestCase):
             )
 
     @mock.patch("beta9.abstractions.endpoint.Endpoint.prepare_runtime", return_value=True)
-    def test_print_invocation_snippet_hides_custom_domain_when_not_deployed_and_failed_deploy(self, _prep_mock):
+    def test_print_invocation_snippet_hides_custom_domain_when_not_deployed_and_failed_deploy(
+        self, _prep_mock
+    ):
         @endpoint(name="ep-serve", custom_domain="serve.example.com")
         def ep_serve():
             return {}
@@ -418,7 +445,10 @@ class TestDomainSDKAbstractions(TestCase):
             ),
         )
         with mock.patch.object(
-            type(ep_serve.parent), "gateway_stub", new_callable=mock.PropertyMock, return_value=gw_mock
+            type(ep_serve.parent),
+            "gateway_stub",
+            new_callable=mock.PropertyMock,
+            return_value=gw_mock,
         ):
             with mock.patch("beta9.terminal.resource") as resource_mock:
                 ep_serve.parent.print_invocation_snippet()

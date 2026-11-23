@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -459,6 +460,16 @@ type deployStubCustomDomainRepo struct {
 	deleted           []types.Deployment
 	updated           []types.Deployment
 	listedDomains     []types.CustomDomain
+	createErr         error
+	// events records the order of deployment changes, domain syncs and
+	// container stops (see rolloutEventsContainerRepo).
+	events *[]string
+}
+
+func (r *deployStubCustomDomainRepo) record(event string) {
+	if r.events != nil {
+		*r.events = append(*r.events, event)
+	}
 }
 
 func (r *deployStubCustomDomainRepo) GetStubByExternalId(_ context.Context, externalId string, _ ...types.QueryFilter) (*types.StubWithRelated, error) {
@@ -507,6 +518,10 @@ func (r *deployStubCustomDomainRepo) PruneDeployCustomDomains(_ context.Context,
 }
 
 func (r *deployStubCustomDomainRepo) CreateDeployment(_ context.Context, workspaceId uint, name string, version uint, stubId uint, stubType string, appId uint) (*types.Deployment, error) {
+	if r.createErr != nil {
+		return nil, r.createErr
+	}
+	r.record("create")
 	dep := types.Deployment{
 		Id:          99,
 		ExternalId:  "dep-new",
@@ -524,6 +539,7 @@ func (r *deployStubCustomDomainRepo) CreateDeployment(_ context.Context, workspa
 }
 
 func (r *deployStubCustomDomainRepo) UpdateDeployment(_ context.Context, dep types.Deployment) (*types.Deployment, error) {
+	r.record(fmt.Sprintf("update %s active=%t", dep.ExternalId, dep.Active))
 	r.updated = append(r.updated, dep)
 	return &dep, nil
 }
@@ -550,6 +566,7 @@ func (r *deployStubCustomDomainRepo) UpsertCustomDomains(_ context.Context, doma
 // step, failing as a whole, and doing nothing for a stale (older) deploy.
 func (r *deployStubCustomDomainRepo) SyncDeployCustomDomains(ctx context.Context, workspaceId uint, deploymentName, stubType string, _ uint, domains []*types.CustomDomain) (*types.DeployCustomDomainSync, error) {
 	r.synced++
+	r.record("sync")
 	if r.syncStale {
 		return &types.DeployCustomDomainSync{Stale: true}, nil
 	}
@@ -685,6 +702,34 @@ func TestDeployStubCustomDomainValidationAndRollback(t *testing.T) {
 	require.False(t, resp.Ok)
 	require.Contains(t, resp.ErrMsg, "other-api")
 	require.Empty(t, conflictRepo.created)
+
+	// 4b. Rejects declaring a domain that is pinned to an older version of this
+	// deployment: it would keep routing to that version and 404 once it stops.
+	pinnedRepo := &deployStubCustomDomainRepo{
+		stub: &types.StubWithRelated{
+			Stub:      types.Stub{Id: 6, ExternalId: "stub-pinned", Type: types.StubType(types.StubTypeEndpointDeployment), Config: `{"extra":{"custom_domain":["pinned.customer.io"]}}`},
+			Workspace: types.Workspace{Id: 1, ExternalId: "ws-1"},
+		},
+		latestDeployment:  &prevDep,
+		activeDeployments: []types.DeploymentWithRelated{prevDep},
+		existingDomains: map[string]*types.CustomDomain{
+			"pinned.customer.io": {
+				WorkspaceId:    1,
+				Domain:         "pinned.customer.io",
+				DeploymentName: "my-api",
+				StubType:       types.StubTypeEndpointDeployment,
+				Version:        1,
+				Source:         types.CustomDomainSourceAPI,
+			},
+		},
+	}
+	pinnedSvc := &GatewayService{backendRepo: pinnedRepo, containerRepo: &deploymentLifecycleContainerRepo{}, redisClient: rdb}
+	resp, err = pinnedSvc.DeployStub(ctx, &pb.DeployStubRequest{StubId: "stub-pinned", Name: "my-api"})
+	require.NoError(t, err)
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrMsg, "pinned to version 1")
+	require.Empty(t, pinnedRepo.created)
+	require.Empty(t, pinnedRepo.updated, "the running version must not be stopped")
 
 	// 5. Re-deploying with fewer domains prunes removed deploy-sourced domains but keeps API-sourced domains, and invalidates pruned cache.
 	require.NoError(t, rdb.Set(ctx, common.CustomDomainHandlerCacheKey("removed.customer.io"), "/endpoint/my-api/latest", time.Minute).Err())
@@ -834,4 +879,109 @@ func TestDeployStubCustomDomainGate(t *testing.T) {
 	require.True(t, resp.Ok, resp.ErrMsg)
 	require.Len(t, repo.upserted, 1)
 	require.Equal(t, int32(2), calls.Load())
+}
+
+// rolloutEventsContainerRepo records when the gateway lists a deployment's
+// containers to stop them, into the same event log as the backend repo.
+type rolloutEventsContainerRepo struct {
+	repository.ContainerRepository
+	events *[]string
+	err    error
+}
+
+func (r *rolloutEventsContainerRepo) GetActiveContainersByStubId(stubId string) ([]types.ContainerState, error) {
+	*r.events = append(*r.events, "stop containers "+stubId)
+	return nil, r.err
+}
+
+// A rollout that replaces the previous version only stops that version's
+// containers once the new deployment and its custom domains are saved; any
+// failure before then reactivates the previous version, whose containers were
+// never touched, so it does not have to cold-start.
+func TestDeployStubStopsPreviousContainersOnlyAfterDomainsBind(t *testing.T) {
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Workspace: &types.Workspace{Id: 1, ExternalId: "ws-1", Name: "default"},
+	})
+	rdb, err := repository.NewRedisClientForTest()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	prevDep := types.DeploymentWithRelated{
+		Deployment: types.Deployment{
+			Id: 10, ExternalId: "dep-v1", Name: "my-api", Active: true,
+			WorkspaceId: 1, StubType: types.StubTypeEndpointDeployment, Version: 1,
+		},
+		Stub: types.Stub{ExternalId: "stub-v1", Type: types.StubType(types.StubTypeEndpointDeployment), Config: `{}`},
+	}
+	// A writable durable disk makes the rollout stop the previous version.
+	cfg, err := json.Marshal(types.StubConfigV1{
+		Disks: []*pb.DurableDisk{{Name: "data"}},
+		Extra: json.RawMessage(`{"custom_domain":["a.customer.io"]}`),
+	})
+	require.NoError(t, err)
+
+	deploy := func(configure func(*deployStubCustomDomainRepo, *rolloutEventsContainerRepo)) (*pb.DeployStubResponse, *deployStubCustomDomainRepo, []string) {
+		events := []string{}
+		repo := &deployStubCustomDomainRepo{
+			stub: &types.StubWithRelated{
+				Stub:      types.Stub{Id: 2, ExternalId: "stub-v2", Type: types.StubType(types.StubTypeEndpointDeployment), Config: string(cfg)},
+				Workspace: types.Workspace{Id: 1, ExternalId: "ws-1"},
+			},
+			latestDeployment:  &prevDep,
+			activeDeployments: []types.DeploymentWithRelated{prevDep},
+			events:            &events,
+		}
+		containers := &rolloutEventsContainerRepo{events: &events}
+		if configure != nil {
+			configure(repo, containers)
+		}
+		svc := &GatewayService{backendRepo: repo, containerRepo: containers, redisClient: rdb}
+		resp, err := svc.DeployStub(ctx, &pb.DeployStubRequest{StubId: "stub-v2", Name: "my-api"})
+		require.NoError(t, err)
+		return resp, repo, events
+	}
+
+	// Success: deactivate v1, create v2, bind domains, then stop v1's containers.
+	resp, _, events := deploy(nil)
+	require.True(t, resp.Ok, resp.ErrMsg)
+	require.Equal(t, []string{
+		"update dep-v1 active=false",
+		"create",
+		"sync",
+		"stop containers stub-v1",
+	}, events)
+
+	// Domain sync fails: v2 is removed and v1 reactivated; its containers are never stopped.
+	resp, repo, events := deploy(func(r *deployStubCustomDomainRepo, _ *rolloutEventsContainerRepo) {
+		r.pruneErr = errors.New("prune failed")
+	})
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrMsg, "Failed to bind custom domains")
+	require.Len(t, repo.deleted, 1)
+	require.Equal(t, []string{
+		"update dep-v1 active=false",
+		"create",
+		"sync",
+		"update dep-v1 active=true",
+	}, events)
+
+	// Creating v2 fails: v1 is reactivated (before this change it stayed inactive).
+	resp, repo, events = deploy(func(r *deployStubCustomDomainRepo, _ *rolloutEventsContainerRepo) {
+		r.createErr = errors.New("insert failed")
+	})
+	require.False(t, resp.Ok)
+	require.Empty(t, repo.deleted)
+	require.Equal(t, []string{
+		"update dep-v1 active=false",
+		"update dep-v1 active=true",
+	}, events)
+
+	// Stopping v1's containers fails: the deploy is undone as before.
+	resp, repo, events = deploy(func(_ *deployStubCustomDomainRepo, c *rolloutEventsContainerRepo) {
+		c.err = errors.New("container store unavailable")
+	})
+	require.False(t, resp.Ok)
+	require.Contains(t, resp.ErrMsg, "Unable to stop previous deployment")
+	require.Len(t, repo.deleted, 1)
+	require.Equal(t, "update dep-v1 active=true", events[len(events)-1])
 }

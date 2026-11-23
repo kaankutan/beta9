@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -857,4 +858,55 @@ func (r *inactiveCustomDomainRepo) GetDeploymentByCustomDomain(_ context.Context
 		return nil, cd, types.ErrCustomDomainDeploymentInactive
 	}
 	return nil, nil, types.ErrCustomDomainNotFound
+}
+
+// activeListingRepo also lists the active custom domains, like the real
+// repository, so the middleware can skip lookups for hosts outside that list.
+type activeListingRepo struct {
+	*countingRepo
+	active []string
+}
+
+func (r *activeListingRepo) ListActiveCustomDomainNames(context.Context) ([]string, error) {
+	return r.active, nil
+}
+
+func TestSubdomainMiddlewareSkipsLookupsForHostsThatAreNotActiveDomains(t *testing.T) {
+	redisClient, err := NewRedisClientForTest()
+	assert.NoError(t, err)
+
+	repo := &activeListingRepo{
+		countingRepo: &countingRepo{middlewareRepoForTest: &middlewareRepoForTest{
+			customDomains: map[string]*types.CustomDomain{
+				"live.mycompany.com": {Domain: "live.mycompany.com", DeploymentName: "live", Status: types.CustomDomainStatusActive},
+			},
+			stub: &types.Stub{Type: types.StubType(types.StubTypeEndpointDeployment), Config: `{"authorized":false}`, ExternalId: "stub-live"},
+		}},
+		active: []string{"live.mycompany.com"},
+	}
+
+	e := echo.New()
+	e.GET("/endpoint/public/:stubId", func(ctx echo.Context) error { return ctx.String(http.StatusOK, "routed") })
+	mw := Subdomain("https://app.example.com", repo, redisClient)
+	next := func(ctx echo.Context) error { return ctx.String(http.StatusNotFound, "nf") }
+
+	serve := func(host string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		assert.NoError(t, mw(next)(e.NewContext(req, rec)))
+		return rec
+	}
+
+	// Every request with a different made-up Host would otherwise cost a query.
+	for i := 0; i < 50; i++ {
+		rec := serve(fmt.Sprintf("random-%d.attacker.example", i))
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	}
+	assert.Equal(t, 0, repo.lookups, "hosts that are not active custom domains must not reach the database")
+
+	rec := serve("live.mycompany.com")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "routed", rec.Body.String())
+	assert.Equal(t, 1, repo.lookups)
 }

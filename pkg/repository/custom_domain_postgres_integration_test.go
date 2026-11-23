@@ -166,6 +166,11 @@ func TestCustomDomainPostgresIntegration(t *testing.T) {
 	require.NotNil(t, demoted1)
 	require.Equal(t, types.CustomDomainStatusFailed, demoted1.Status)
 
+	// Only the active claim is listed, once, whichever workspace holds it.
+	activeNames, err := repo.ListActiveCustomDomainNames(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, countOf(activeNames, "api.example.com"))
+
 	// Re-activate ws1 to test inactive deployment detection.
 	_, err = repo.ActivateCustomDomain(ctx, ws1ID, cd1.ExternalId)
 	require.NoError(t, err)
@@ -424,4 +429,14 @@ func assertSet(got []string, want ...string) bool {
 		}
 	}
 	return true
+}
+
+func countOf(values []string, want string) int {
+	n := 0
+	for _, v := range values {
+		if v == want {
+			n++
+		}
+	}
+	return n
 }

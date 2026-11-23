@@ -288,9 +288,10 @@ func TestDomainGroupCRUDVerifyAndCheck(t *testing.T) {
 	require.Equal(t, "pending", created["status"])
 	require.Equal(t, "https://api.customer.io", created["url"])
 	require.Equal(t, "_beta9-challenge.api.customer.io", created["txt_record_name"])
-	require.Equal(t, "my-api-abc1234.app.example.com", created["cname_target"])
 	token, _ := created["verification_token"].(string)
 	require.NotEmpty(t, token)
+	require.Equal(t, common.CustomDomainCNAMETarget(1, "api.customer.io", "app.example.com"), created["cname_target"])
+	require.Regexp(t, `^cd-[0-9a-f]{32}\.app\.example\.com$`, created["cname_target"])
 
 	// List
 	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/domain/ws-1", nil)
@@ -351,6 +352,18 @@ func TestDomainGroupCRUDVerifyAndCheck(t *testing.T) {
 	err = group.Retrieve(domainAuthContext(e, getReq, getRec, []string{"workspaceId", "domainId"}, []string{"ws-1", "api.customer.io"}))
 	require.ErrorAs(t, err, &httpErr)
 	require.Equal(t, http.StatusNotFound, httpErr.Code)
+
+	// Adding the domain again keeps its CNAME target, so an existing CNAME
+	// record still verifies it.
+	recreateReq := httptest.NewRequest(http.MethodPost, "/api/v1/domain/ws-1", strings.NewReader(`{"domain":"api.customer.io","deployment_name":"my-api"}`))
+	recreateReq.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	recreateRec := httptest.NewRecorder()
+	require.NoError(t, group.Create(domainAuthContext(e, recreateReq, recreateRec, []string{"workspaceId"}, []string{"ws-1"})))
+	require.Equal(t, http.StatusCreated, recreateRec.Code)
+	var recreated map[string]any
+	require.NoError(t, json.Unmarshal(recreateRec.Body.Bytes(), &recreated))
+	require.Equal(t, created["cname_target"], recreated["cname_target"])
+	require.NotEqual(t, created["verification_token"], recreated["verification_token"])
 }
 
 func TestDomainGroupRejectsClusterSubdomainAndRequiresDNSVerify(t *testing.T) {
@@ -499,10 +512,12 @@ func TestDomainGroupCreateValidationAndTargetResolution(t *testing.T) {
 	require.Equal(t, types.StubTypePodDeployment, repo.domains[domainMapKey(1, "pod.customer.io")].StubType)
 	require.Equal(t, uint32(9000), repo.domains[domainMapKey(1, "pod.customer.io")].Port)
 
-	// CNAME verification accepts deployment's exact CNAME target and rejects another deployment's subdomain.
+	// CNAME verification accepts only the claim's own target. Pointing at the
+	// deployment's subdomain proves nothing: its short hash can be collided by
+	// another workspace choosing a deployment name.
 	cnameResolver := &domainTestDNSResolver{
 		txtRecords: map[string][]string{},
-		cnames:     map[string]string{"cname.customer.io": "other-app-9999999.app.example.com."},
+		cnames:     map[string]string{"cname.customer.io": "my-api-abc1234.app.example.com."},
 	}
 	cnameGroup := newDomainGroupForTest(repo, cnameResolver)
 	code, err = postCreate(`{"domain":"cname.customer.io","deployment_name":"my-api"}`)
@@ -514,7 +529,8 @@ func TestDomainGroupCreateValidationAndTargetResolution(t *testing.T) {
 	require.NoError(t, cnameGroup.Verify(domainAuthContext(e, vReq, vRec, []string{"workspaceId", "domainId"}, []string{"ws-1", "cname.customer.io"})))
 	require.Equal(t, http.StatusBadRequest, vRec.Code)
 
-	cnameResolver.cnames["cname.customer.io"] = "MY-API-ABC1234.app.example.com."
+	claimTarget := common.CustomDomainCNAMETarget(1, "cname.customer.io", "app.example.com")
+	cnameResolver.cnames["cname.customer.io"] = strings.ToUpper(claimTarget) + "."
 	vReq2 := httptest.NewRequest(http.MethodPost, "/api/v1/domain/ws-1/cname.customer.io/verify", nil)
 	vRec2 := httptest.NewRecorder()
 	require.NoError(t, cnameGroup.Verify(domainAuthContext(e, vReq2, vRec2, []string{"workspaceId", "domainId"}, []string{"ws-1", "cname.customer.io"})))
@@ -582,6 +598,17 @@ func TestDomainGroupMultiWorkspaceTakeoverAndCheckToken(t *testing.T) {
 	require.NoError(t, group.Verify(authFor(ws2, httptest.NewRequest(http.MethodPost, "/", nil), vRec2Fail, []string{"workspaceId", "domainId"}, []string{"ws-2", "shared.customer.io"})))
 	require.Equal(t, http.StatusBadRequest, vRec2Fail.Code)
 	require.Equal(t, types.CustomDomainStatusActive, repo.domains[domainMapKey(1, "shared.customer.io")].Status)
+
+	// Pointing the domain at workspace 1's CNAME target proves nothing for
+	// workspace 2: each workspace has its own target for the domain.
+	ws1Target := common.CustomDomainCNAMETarget(1, "shared.customer.io", "app.example.com")
+	require.NotEqual(t, ws1Target, common.CustomDomainCNAMETarget(2, "shared.customer.io", "app.example.com"))
+	resolver.cnames["shared.customer.io"] = ws1Target + "."
+	vRec2CNAME := httptest.NewRecorder()
+	require.NoError(t, group.Verify(authFor(ws2, httptest.NewRequest(http.MethodPost, "/", nil), vRec2CNAME, []string{"workspaceId", "domainId"}, []string{"ws-2", "shared.customer.io"})))
+	require.Equal(t, http.StatusBadRequest, vRec2CNAME.Code)
+	require.Equal(t, types.CustomDomainStatusActive, repo.domains[domainMapKey(1, "shared.customer.io")].Status)
+	delete(resolver.cnames, "shared.customer.io")
 
 	// Once WS2 proves DNS, WS2 becomes active and WS1 is demoted to failed.
 	tok2 := repo.domains[domainMapKey(2, "shared.customer.io")].VerificationToken
@@ -802,6 +829,19 @@ func TestDomainCheckClusterRateLimit(t *testing.T) {
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
+
+	// Every counter expires with its window.
+	require.Greater(t, mr.TTL("api:custom_domain:check:rl:10.5.5.5"), time.Duration(0))
+
+	// A counter left without a TTL (e.g. by a failed EXPIRE) gets one back
+	// instead of limiting its client forever.
+	require.NoError(t, mr.Set("api:custom_domain:check:rl:10.7.7.7", "99"))
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/domain/check?domain=nope.customer.io", nil)
+	req.RemoteAddr = "10.7.7.7:1000"
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Greater(t, mr.TTL("api:custom_domain:check:rl:10.7.7.7"), time.Duration(0))
 }
 
 type domainSlowTXTResolver struct {

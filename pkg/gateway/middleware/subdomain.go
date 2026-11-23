@@ -45,6 +45,46 @@ func Subdomain(externalURL string, backendRepo common.SubdomainBackendRepo, redi
 	return SubdomainWithReservedHosts(externalURL, nil, backendRepo, redisClient)
 }
 
+const customDomainOriginalRequestKey = "beta9.custom_domain.original_request"
+
+type customDomainOriginalRequest struct {
+	path       string
+	requestURI string
+}
+
+// PreserveCustomDomainPath must run before trailing-slash removal. It records
+// the request path of hosts that may be custom domains, because whether such
+// a host is a bound custom domain is only known once the subdomain middleware
+// has looked it up. A bound domain then forwards the path the client sent; any
+// other host keeps the normalized path, so API routing on hosts that are not
+// custom domains (internal service names, other platform hostnames) still
+// gets its trailing slash removed.
+func PreserveCustomDomainPath(externalURL string, reservedHosts []string) echo.MiddlewareFunc {
+	baseDomain := ParseHostFromURL(externalURL)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			if IsCandidateCustomDomain(ctx.Request().Host, baseDomain, reservedHosts...) {
+				ctx.Set(customDomainOriginalRequestKey, customDomainOriginalRequest{
+					path:       ctx.Request().URL.Path,
+					requestURI: ctx.Request().RequestURI,
+				})
+			}
+			return next(ctx)
+		}
+	}
+}
+
+// SubdomainHandlerCacheKey is where routing for a deployment subdomain is
+// cached, as "<workspace external id>|<handler path>". Gateways before custom
+// domains cached a bare path under "middleware:subdomain:%s:handler" and use
+// whatever they find there as a path, so this format needs its own key: shared,
+// old replicas would misroute subdomain traffic during a rolling upgrade or a
+// rollback.
+func SubdomainHandlerCacheKey(subdomain string) string {
+	return fmt.Sprintf("middleware:subdomain:%s:handler:v2", subdomain)
+}
+
 func encodeCachedHandler(handlerPath, workspaceExternalID string) string {
 	return workspaceExternalID + "|" + handlerPath
 }
@@ -53,8 +93,8 @@ func decodeCachedHandler(raw string) (handlerPath, workspaceExternalID string, o
 	if raw == "" || raw == negativeHandlerValue || raw == inactiveHandlerValue {
 		return "", "", false
 	}
-	// Legacy cache entries stored only the path (starting with "/"); treat them
-	// as a cache miss so they are refreshed with workspace ownership metadata.
+	// A bare path (the format old gateways cached) carries no workspace
+	// ownership; treat it as a miss so it is refreshed with that metadata.
 	if strings.HasPrefix(raw, "/") {
 		return "", "", false
 	}
@@ -69,6 +109,10 @@ func decodeCachedHandler(raw string) (handlerPath, workspaceExternalID string, o
 // platform hosts (gRPC, Pod TCP, internal hostnames) from custom domain lookup.
 func SubdomainWithReservedHosts(externalURL string, reservedHosts []string, backendRepo common.SubdomainBackendRepo, redisClient *common.RedisClient) echo.MiddlewareFunc {
 	baseDomain := ParseHostFromURL(externalURL)
+	// Hosts outside this set of active custom domains are never looked up in
+	// the database, so arbitrary Host headers cannot cost a query each.
+	activeLister, _ := backendRepo.(common.ActiveCustomDomainLister)
+	activeDomains := common.NewActiveCustomDomainSet(activeLister, redisClient)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
@@ -78,7 +122,7 @@ func SubdomainWithReservedHosts(externalURL string, reservedHosts []string, back
 			host := ctx.Request().Host
 
 			if subdomain := ParseSubdomain(host, baseDomain); subdomain != "" {
-				handlerKey := fmt.Sprintf("middleware:subdomain:%s:handler", subdomain)
+				handlerKey := SubdomainHandlerCacheKey(subdomain)
 				if redisClient != nil {
 					if raw, err := redisClient.Get(ctx.Request().Context(), handlerKey).Result(); err == nil {
 						if p, wsID, ok := decodeCachedHandler(raw); ok {
@@ -134,6 +178,13 @@ func SubdomainWithReservedHosts(externalURL string, reservedHosts []string, back
 				}
 
 				if handlerPath == "" {
+					if !activeDomains.MayBeActive(ctx.Request().Context(), normalizedHost) {
+						// Not an active custom domain. Nothing is cached in Redis: this
+						// gateway's set can lag a moment behind a domain verified on
+						// another one, and a shared miss would outlive that.
+						return next(ctx)
+					}
+
 					var (
 						stub   *types.Stub
 						fields *common.SubdomainFields
@@ -168,6 +219,15 @@ func SubdomainWithReservedHosts(externalURL string, reservedHosts []string, back
 				}
 			} else {
 				return next(ctx)
+			}
+
+			if isCustomDomain {
+				// Forward the path the client sent, not the one trailing-slash
+				// removal produced for normal API routing.
+				if original, ok := ctx.Get(customDomainOriginalRequestKey).(customDomainOriginalRequest); ok {
+					ctx.Request().URL.Path = original.path
+					ctx.Request().RequestURI = original.requestURI
+				}
 			}
 
 			originalPath := ctx.Request().URL.Path

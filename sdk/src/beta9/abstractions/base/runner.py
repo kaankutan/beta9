@@ -342,15 +342,14 @@ class RunnerAbstraction(BaseAbstraction):
 
             if self.custom_domain and not self.tcp and getattr(self, "deployment_id", ""):
                 scheme = (
-                    "http" if isinstance(res.url, str) and res.url.startswith("http://") else "https"
+                    "http"
+                    if isinstance(res.url, str) and res.url.startswith("http://")
+                    else "https"
                 )
                 for domain in self.custom_domain:
-                    terminal.print("\tCustom domain (requires DNS verification): ", end="")
+                    terminal.print("\tCustom domain: ", end="")
                     terminal.url(f"{scheme}://{domain}")
-                terminal.detail(
-                    f"\tAdd the DNS records shown by `{terminal.cli_name()} domain list -d {self.name}`, "
-                    f"then run `{terminal.cli_name()} domain verify <domain>` to activate it."
-                )
+                terminal.detail(f"\t{self._custom_domain_dns_hint()}")
 
             terminal.print("")
             return res
@@ -388,10 +387,7 @@ class RunnerAbstraction(BaseAbstraction):
             )
         terminal.resource("Endpoint", resource_fields)
         if self.custom_domain and has_deployment:
-            terminal.detail(
-                f"Add the DNS records shown by `{terminal.cli_name()} domain list -d {self.name}`, "
-                f"then run `{terminal.cli_name()} domain verify <domain>` to activate the domain."
-            )
+            terminal.detail(self._custom_domain_dns_hint())
         if self.authorized and os.getenv("BETA9_TOKEN") != self.config_context.token:
             terminal.detail("Set the token from your selected profile:", dim=False)
             terminal.print("export BETA9_TOKEN='<your-profile-token>'", crop=False)
@@ -538,6 +534,17 @@ class RunnerAbstraction(BaseAbstraction):
         if isinstance(gpu, list):
             return [GpuType(normalize_gpu_type(g)).value for g in gpu]
         return [GpuType(normalize_gpu_type(gpu)).value]
+
+    def _custom_domain_dns_hint(self) -> str:
+        # The deploy does not report whether a domain is already active, so the
+        # hint is conditional. `domain list` shows no DNS records; `domain get`
+        # shows a domain's status and the TXT and CNAME records to create.
+        cli = terminal.cli_name()
+        domain = self.custom_domain[0] if len(self.custom_domain) == 1 else "<domain>"
+        return (
+            f"A new domain is pending until verified: run `{cli} domain get {domain}` "
+            f"for its status and DNS records, then `{cli} domain verify {domain}`."
+        )
 
     def parse_custom_domain(self, value: Optional[Union[str, Sequence[Any]]]) -> List[str]:
         if value is None:

@@ -215,3 +215,17 @@ func TestBuildSandboxURL(t *testing.T) {
 		})
 	}
 }
+
+func TestCustomDomainCNAMETargetIsPerWorkspaceAndStable(t *testing.T) {
+	a := CustomDomainCNAMETarget(1, "API.customer.io.", "App.Example.com.")
+
+	assert.Regexp(t, `^cd-[0-9a-f]{32}\.app\.example\.com$`, a)
+	// Same workspace and domain: the same target, so DNS survives a re-add.
+	assert.Equal(t, a, CustomDomainCNAMETarget(1, "api.customer.io", "app.example.com"))
+	// Another workspace, or another domain, never shares it.
+	assert.NotEqual(t, a, CustomDomainCNAMETarget(2, "api.customer.io", "app.example.com"))
+	assert.NotEqual(t, a, CustomDomainCNAMETarget(1, "www.customer.io", "app.example.com"))
+	assert.Equal(t, "", CustomDomainCNAMETarget(0, "api.customer.io", "app.example.com"))
+	assert.Equal(t, "", CustomDomainCNAMETarget(1, "", "app.example.com"))
+	assert.Equal(t, "", CustomDomainCNAMETarget(1, "api.customer.io", ""))
+}

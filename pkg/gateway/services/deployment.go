@@ -12,6 +12,7 @@ import (
 	common "github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/types"
 	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/utils/ptr"
 )
@@ -319,17 +320,53 @@ func (gws *GatewayService) DeleteDeployment(ctx context.Context, in *pb.DeleteDe
 }
 
 func (gws *GatewayService) stopDeployments(deployments []types.DeploymentWithRelated, ctx context.Context) error {
+	if err := gws.deactivateDeployments(ctx, deployments); err != nil {
+		return err
+	}
+	return gws.stopDeactivatedDeployments(ctx, deployments)
+}
+
+// deactivateDeployments marks deployments inactive without touching their
+// scheduled jobs, instances or containers, so a rollout that fails before
+// stopDeactivatedDeployments can undo it with reactivateDeployments.
+func (gws *GatewayService) deactivateDeployments(ctx context.Context, deployments []types.DeploymentWithRelated) error {
+	for _, deployment := range deployments {
+		deployment.Active = false
+		if _, err := gws.backendRepo.UpdateDeployment(ctx, deployment.Deployment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reactivateDeployments marks deployments active again after a failed rollout
+// and reloads their instances. It returns one message per deployment it could
+// not reactivate.
+func (gws *GatewayService) reactivateDeployments(ctx context.Context, deployments []types.DeploymentWithRelated) []string {
+	var failures []string
+	for _, deployment := range deployments {
+		deployment.Active = true
+		if _, err := gws.backendRepo.UpdateDeployment(ctx, deployment.Deployment); err != nil {
+			log.Error().Err(err).Str("deployment_id", deployment.ExternalId).Msg("failed to restore previous deployment")
+			failures = append(failures, fmt.Sprintf("previous deployment %s could not be reactivated", deployment.ExternalId))
+			continue
+		}
+		gws.reloadInstances(deployment.Stub.ExternalId, deployment.StubType)
+	}
+	return failures
+}
+
+// stopDeactivatedDeployments finishes stopping deployments that
+// deactivateDeployments marked inactive: it removes their scheduled jobs,
+// reloads their instances, drops cached custom domain routing and stops their
+// containers.
+func (gws *GatewayService) stopDeactivatedDeployments(ctx context.Context, deployments []types.DeploymentWithRelated) error {
 	for _, deployment := range deployments {
 		// Stop scheduled job
 		if deployment.StubType == types.StubTypeScheduledJobDeployment {
 			if scheduledJob, err := gws.backendRepo.GetScheduledJob(ctx, deployment.Id); err == nil {
 				gws.backendRepo.DeleteScheduledJob(ctx, scheduledJob)
 			}
-		}
-
-		deployment.Active = false
-		if _, err := gws.backendRepo.UpdateDeployment(ctx, deployment.Deployment); err != nil {
-			return err
 		}
 
 		gws.reloadInstances(deployment.Stub.ExternalId, deployment.StubType)

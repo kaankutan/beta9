@@ -259,6 +259,7 @@ type BackendRepository interface {
 	SyncDeployCustomDomains(ctx context.Context, workspaceId uint, deploymentName, stubType string, deployVersion uint, domains []*types.CustomDomain) (*types.DeployCustomDomainSync, error)
 	GetCustomDomainByIdentifier(ctx context.Context, workspaceId uint, idOrDomain string) (*types.CustomDomain, error)
 	GetActiveCustomDomainByDomain(ctx context.Context, domain string) (*types.CustomDomain, error)
+	ListActiveCustomDomainNames(ctx context.Context) ([]string, error)
 	ListCustomDomains(ctx context.Context, workspaceId uint, deploymentName string) ([]types.CustomDomain, error)
 	ActivateCustomDomain(ctx context.Context, workspaceId uint, externalId string) (*types.CustomDomain, error)
 	DeleteCustomDomain(ctx context.Context, workspaceId uint, idOrDomain string) (*types.CustomDomain, error)

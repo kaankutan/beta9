@@ -360,6 +360,10 @@ type panicRecoveryTestRepo struct {
 	repository.BackendRepository
 }
 
+func (r *panicRecoveryTestRepo) ListActiveCustomDomainNames(context.Context) ([]string, error) {
+	return []string{"panic.customer.io"}, nil
+}
+
 func (r *panicRecoveryTestRepo) GetDeploymentByCustomDomain(_ context.Context, domain string) (*types.DeploymentWithRelated, *types.CustomDomain, error) {
 	if domain != "panic.customer.io" {
 		return nil, nil, types.ErrCustomDomainNotFound
@@ -411,4 +415,73 @@ func TestGatewayHTTPMiddlewareRecoversPanicOnCustomDomainRoute(t *testing.T) {
 		e.ServeHTTP(rec, req)
 	})
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+type trailingSlashTestRepo struct {
+	repository.BackendRepository
+}
+
+func (r *trailingSlashTestRepo) ListActiveCustomDomainNames(context.Context) ([]string, error) {
+	return []string{"slash.customer.io"}, nil
+}
+
+func (r *trailingSlashTestRepo) GetDeploymentByCustomDomain(_ context.Context, domain string) (*types.DeploymentWithRelated, *types.CustomDomain, error) {
+	if domain != "slash.customer.io" {
+		return nil, nil, types.ErrCustomDomainNotFound
+	}
+	return &types.DeploymentWithRelated{
+			Deployment: types.Deployment{Name: "slash-app", Subdomain: "slash-app-abc1234"},
+			Workspace:  types.Workspace{ExternalId: "ws-1"},
+			Stub: types.Stub{
+				ExternalId: "stub-asgi",
+				Type:       types.StubType(types.StubTypeASGIDeployment),
+				Config:     `{"authorized":false}`,
+			},
+		}, &types.CustomDomain{
+			Domain: "slash.customer.io",
+			Status: types.CustomDomainStatusActive,
+		}, nil
+}
+
+// Hosts that are not bound custom domains (internal service names, other
+// platform hostnames) must keep trailing-slash removal for API routing, while
+// a bound custom domain forwards the path exactly as the client sent it.
+func TestGatewayHTTPMiddlewareTrailingSlashByHost(t *testing.T) {
+	g := &Gateway{
+		BackendRepo: &trailingSlashTestRepo{},
+		Config: types.AppConfig{
+			GatewayService: types.GatewayServiceConfig{
+				HTTP: types.HTTPConfig{
+					ExternalHost: "app.example.com",
+					ExternalPort: 443,
+					TLS:          true,
+				},
+			},
+		},
+	}
+
+	e := echo.New()
+	g.registerHTTPMiddleware(e)
+	e.GET("/api/v1/things", func(c echo.Context) error {
+		return c.String(http.StatusOK, "api:"+c.Request().URL.Path)
+	})
+	e.GET("/asgi/public/:stubId/:subPath", func(c echo.Context) error {
+		return c.String(http.StatusOK, "asgi:"+c.Request().URL.Path)
+	})
+
+	serve := func(host, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := serve("beta9-gateway.beta9.svc:1994", "/api/v1/things/")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "api:/api/v1/things", rec.Body.String())
+
+	rec = serve("slash.customer.io", "/docs/")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "asgi:/asgi/public/stub-asgi/docs/", rec.Body.String())
 }

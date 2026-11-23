@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,14 @@ type crossWorkspaceTestBackendRepo struct {
 	subdomains    map[string]*types.DeploymentWithRelated
 	deployments   []types.DeploymentWithRelated
 	stubs         map[string]*types.StubWithRelated
+}
+
+func (r *crossWorkspaceTestBackendRepo) ListActiveCustomDomainNames(context.Context) ([]string, error) {
+	names := make([]string, 0, len(r.customDomains))
+	for domain := range r.customDomains {
+		names = append(names, domain)
+	}
+	return names, nil
 }
 
 func (r *crossWorkspaceTestBackendRepo) GetDeploymentByCustomDomain(_ context.Context, domain string) (*types.DeploymentWithRelated, *types.CustomDomain, error) {
@@ -288,6 +297,13 @@ func TestSubdomainMiddlewarePreventsCrossWorkspaceRouting(t *testing.T) {
 	require.Equal(t, "stub-ep-a", rec.Body.String())
 	rec = doReq(http.MethodPost, "api-aaaaaaa-v1.app.example.com", "tok-b")
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	// The "<workspace>|<path>" entry lives under its own key: gateways from
+	// before this format read "middleware:subdomain:%s:handler" as a bare path.
+	cached, err := redisClient.Get(context.Background(), middleware.SubdomainHandlerCacheKey("api-aaaaaaa-v1")).Result()
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(cached, "|/endpoint/api/v1"), cached)
+	require.Equal(t, int64(0), redisClient.Exists(context.Background(), "middleware:subdomain:api-aaaaaaa-v1:handler").Val())
 
 	// 8. Public custom domain remains accessible without a token and with any unrelated token.
 	rec = doReq(http.MethodPost, "public.acme.com", "")

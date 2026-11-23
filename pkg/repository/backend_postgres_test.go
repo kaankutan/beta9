@@ -799,6 +799,21 @@ func customDomainRows(domain, deploymentName string, version uint, port uint32, 
 }
 
 func TestCustomDomainSQLAndTransactions(t *testing.T) {
+	t.Run("ListActiveCustomDomainNames lists only active claims", func(t *testing.T) {
+		repo, mock := NewBackendPostgresRepositoryForTest()
+		mock.ExpectQuery(`SELECT domain FROM custom_domain WHERE status = 'active'`).
+			WillReturnRows(sqlmock.NewRows([]string{"domain"}).AddRow("api.customer.io").AddRow("www.customer.io"))
+
+		names, err := repo.ListActiveCustomDomainNames(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []string{"api.customer.io", "www.customer.io"}, names)
+		require.NoError(t, mock.ExpectationsWereMet())
+
+		mock.ExpectQuery(`SELECT domain FROM custom_domain WHERE status = 'active'`).WillReturnError(errors.New("db down"))
+		_, err = repo.ListActiveCustomDomainNames(context.Background())
+		require.Error(t, err)
+	})
+
 	t.Run("CreateCustomDomain inserts pending claim and maps conflict", func(t *testing.T) {
 		repo, mock := NewBackendPostgresRepositoryForTest()
 		mock.ExpectQuery(`ON CONFLICT \(workspace_id, domain\) DO NOTHING`).

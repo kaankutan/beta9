@@ -139,7 +139,9 @@ func InvalidateDeploymentCustomDomains(ctx context.Context, repo customDomainLis
 	if err != nil || len(domains) == 0 {
 		return
 	}
-	InvalidateCustomDomainCache(ctx, redisClient, CustomDomainNames(domains)...)
+	// The deployment behind the domains changed, not which domains are active,
+	// so gateways need not reload their sets of active domain names.
+	invalidateCustomDomainCache(ctx, redisClient, false, CustomDomainNames(domains)...)
 }
 
 // customDomainMisses is an in-process negative cache fallback when Redis is
@@ -284,36 +286,50 @@ func SetCustomDomainCacheIfCurrent(ctx context.Context, redisClient *RedisClient
 	return err == nil && res == 1
 }
 
+// InvalidateCustomDomainCache drops cached routing and /check answers for
+// domains whose binding changed (created, verified, transferred or removed),
+// and tells every gateway to reload its set of active domain names.
 func InvalidateCustomDomainCache(ctx context.Context, redisClient *RedisClient, domains ...string) {
+	invalidateCustomDomainCache(ctx, redisClient, true, domains...)
+}
+
+func invalidateCustomDomainCache(ctx context.Context, redisClient *RedisClient, bindingChanged bool, domains ...string) {
 	if len(domains) == 0 {
 		return
 	}
-	keys := make([]string, 0, len(domains)*2)
 	normalizedDomains := make([]string, 0, len(domains))
 	for _, domain := range domains {
-		normalized := NormalizeDomain(domain)
-		if normalized == "" {
-			continue
+		if normalized := NormalizeDomain(domain); normalized != "" {
+			normalizedDomains = append(normalizedDomains, normalized)
 		}
-		normalizedDomains = append(normalizedDomains, normalized)
-		keys = append(keys, CustomDomainHandlerCacheKey(normalized), CustomDomainCheckCacheKey(normalized))
 	}
-	if len(keys) == 0 {
+	if len(normalizedDomains) == 0 {
 		return
 	}
 	customDomainMisses.remove(normalizedDomains...)
+	if bindingChanged {
+		customDomainLocalEpoch.Add(1)
+	}
 	if redisClient == nil {
 		return
 	}
 	// Bump the revisions first so any in-flight reader that started before this
 	// change loses its conditional write, then drop what is already cached.
+	// Every command touches the keys of one domain only: they share that
+	// domain's {hash tag}, while keys of different domains live in different
+	// Redis Cluster slots and a multi-key command across them fails (CROSSSLOT).
 	pipe := redisClient.Pipeline()
 	for _, domain := range normalizedDomains {
 		revKey := CustomDomainRevisionKey(domain)
 		pipe.Incr(ctx, revKey)
 		pipe.Expire(ctx, revKey, customDomainRevisionTTL)
 	}
-	pipe.Del(ctx, keys...)
+	for _, domain := range normalizedDomains {
+		pipe.Del(ctx, CustomDomainHandlerCacheKey(domain), CustomDomainCheckCacheKey(domain))
+	}
+	if bindingChanged {
+		pipe.Incr(ctx, customDomainGenerationKey)
+	}
 	_, _ = pipe.Exec(ctx)
 }
 

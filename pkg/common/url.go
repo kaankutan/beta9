@@ -1,6 +1,8 @@
 package common
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 
@@ -115,6 +117,24 @@ func BuildSandboxURL(externalUrl, urlType string, stub *types.StubWithRelated, c
 	}
 
 	return fmt.Sprintf("%s://%s/%s/container/%s/%s/%d", parsedUrl.Scheme, parsedUrl.Host, stub.Type.RouteKind(), stub.ExternalId, containerId, port)
+}
+
+// CustomDomainCNAMETarget returns the host a workspace's claim on domain may
+// CNAME to as proof of ownership. It is a 128-bit hash of the workspace and the
+// domain: no other workspace can get the same target for the domain (workspace
+// IDs are assigned, not chosen), and it stays the same when the workspace
+// removes the domain and adds it again, so its DNS record keeps working.
+// Deployment subdomains are not used: their short hash can be collided by
+// choosing a deployment name, which would let another workspace pass the
+// CNAME check for a domain that points at someone else's deployment.
+func CustomDomainCNAMETarget(workspaceId uint, domain, baseDomain string) string {
+	domain = NormalizeDomain(domain)
+	baseDomain = NormalizeDomain(baseDomain)
+	if workspaceId == 0 || domain == "" || baseDomain == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("beta9-custom-domain-cname:%d:%s", workspaceId, domain)))
+	return fmt.Sprintf("cd-%s.%s", hex.EncodeToString(sum[:16]), baseDomain)
 }
 
 func BuildCustomDomainURL(externalUrl, domain string) string {
